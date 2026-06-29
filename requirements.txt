@@ -11,7 +11,7 @@ triton==3.5.1
 typing_extensions==4.15.0
 sentencepiece==0.2.1
 safetensors==0.7.0
-prettytable==3.18.0
+prettytable==3.17.0
 
 # Data preparation dependencies.
 datasets==4.8.5
