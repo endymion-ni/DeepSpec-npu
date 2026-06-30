@@ -11,7 +11,7 @@ class TwoStageScheduler(_LRScheduler):
 
     def state_dict(self):
         state_dict = {
-            key: value for key, value in self.__dict__.items() if key not in "optimizer"
+            key: value for key, value in self.__dict__.items() if key != "optimizer"
         }
         if isinstance(state_dict["after_scheduler"], _LRScheduler):
             state_dict["after_scheduler_type"] = type(
