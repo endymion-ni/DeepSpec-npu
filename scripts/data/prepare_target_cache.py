@@ -252,6 +252,18 @@ def parse_args():
     parser.add_argument("--local-batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument(
+        "--model-config-path",
+        default=None,
+        help=(
+            "Path to model config files (config.json, tokenizer.json, etc.). "
+            "When set, AutoConfig and AutoTokenizer load from this path "
+            "instead of target_model_name_or_path.  Useful when the config "
+            "has been pre-converted (e.g. via cann-recipes-infer convert_config.py) "
+            "but the original model dir is read-only.  Weights are still loaded "
+            "from target_model_name_or_path."
+        ),
+    )
+    parser.add_argument(
         "--device-map",
         choices=["auto", "single"],
         default=None,
@@ -362,14 +374,20 @@ def main():
     local_total_samples = local_end - local_start
 
     local_subset = Subset(dataset, range(local_start, local_end))
+
+    # Resolve paths: --model-config-path overrides where config/tokenizer are
+    # loaded from (useful when config.json has been pre-converted).
+    _weight_path = config.model.target_model_name_or_path
+    _config_path = cli_args.model_config_path or _weight_path
+
     tokenizer = AutoTokenizer.from_pretrained(
-        config.model.target_model_name_or_path,
+        _config_path,
         trust_remote_code=True,
     )
 
     # Resolve model config (lightweight — no weights downloaded).
     _target_cfg = AutoConfig.from_pretrained(
-        config.model.target_model_name_or_path,
+        _config_path,
         trust_remote_code=True,
     )
     _model_type = str(_target_cfg.model_type)
@@ -394,7 +412,7 @@ def main():
             "or use --device-map single for data-parallel mode."
         )
     target_model = _load_target_model(
-        model_name_or_path=config.model.target_model_name_or_path,
+        model_name_or_path=_weight_path,
         dtype=torch.bfloat16,
         attn_impl=_attn,
         device_map=_device_map,

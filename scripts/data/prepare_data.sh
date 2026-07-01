@@ -5,6 +5,9 @@ set -euo pipefail
 # Override these defaults from the environment to switch target models.
 model_path=${MODEL_PATH:-deepseek-ai/DeepSeek-V4-Flash}
 config_path=${CONFIG_PATH:-config/dspark/dspark_deepseek_v4_flash.py}
+# Local config directory (config.json + tokenizer, pre-converted via convert_config.py).
+# This avoids network access for config files; weights still come from model_path.
+model_config_path=${MODEL_CONFIG_PATH:-models/deepseek_v4_flash_hf_config}
 
 dataset_name=mlabonne/open-perfectblend
 test_size=0.05
@@ -69,10 +72,14 @@ python scripts/data/generate_train_data.py \
 
 echo "Stop inference server before Step 3 if it is using the same devices."
 echo "Step 3/3: preparing target cache: ${cache_dir}"
+echo "  config path : ${model_config_path}"
+echo "  weight path : ${model_path}"
 torchrun \
     --nproc-per-node="${NPROCS}" \
     scripts/data/prepare_target_cache.py \
     --config "${config_path}" \
     --train-data-path "${train_data_path}" \
     --output-dir "${cache_dir}" \
+    --model-config-path "${model_config_path}" \
+    --opts "model.target_model_name_or_path=${model_path}" \
     --local-batch-size 16
