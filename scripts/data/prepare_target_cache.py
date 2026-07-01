@@ -6,7 +6,7 @@ import os
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, Subset
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoConfig, AutoModel, AutoTokenizer
 
 from deepspec.data import ConversationCollator
 from deepspec.data.target_cache_dataset import (
@@ -42,7 +42,6 @@ os.environ["USE_TORCH"] = "true"
 os.environ["WANDB_DISABLED"] = "true"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# PyTorch 2.10 Inductor still reads the legacy allow_tf32 flag while compiling.
 torch.set_float32_matmul_precision("high")
 
 
@@ -50,6 +49,73 @@ torch.set_float32_matmul_precision("high")
 class TargetForwardResult:
     target_hidden_states: torch.Tensor
     target_last_hidden_states: torch.Tensor
+
+
+# ---- Model loading (NPU-aware, with optional device-map sharding) ----
+
+
+def _resolve_device_map(*, model_type: str, cli_device_map: str | None, device: torch.device) -> str | dict | None:
+    """Determine the ``device_map`` value for ``AutoModel.from_pretrained``.
+
+    ================  ========================================================
+    ``--device-map``  behaviour
+    ================  ========================================================
+    ``"auto"``        Use ``accelerate`` to shard layers across all visible
+                      devices.  Best for large models (e.g. DeepSeek-V4).
+    ``"single"``      Load the entire model onto *device* (no sharding).
+                      Suitable when the model fits on a single NPU / GPU.
+    ``None`` (omit)   Auto-detect: ``"auto"`` for ``deepseek_v4`` models,
+                      ``"single"`` for everything else.
+    ================  ========================================================
+    """
+    if cli_device_map == "auto":
+        return "auto"
+    if cli_device_map == "single":
+        return {"": device}
+    if cli_device_map is not None:
+        raise ValueError(f"Unsupported --device-map value: {cli_device_map!r}")
+
+    # Auto-detect: large / custom-attention models → auto shard.
+    if model_type in ("deepseek_v4",):
+        return "auto"
+    return {"": device}
+
+
+def _load_target_model(*, model_name_or_path: str, dtype: torch.dtype, attn_impl: str, device_map):
+    """Load the target model, placing parameters directly on the target device(s).
+
+    When *device_map* is ``"auto"``, ``accelerate`` distributes decoder layers
+    across all visible NPUs / GPUs so that a model larger than a single device
+    can still run.  When *device_map* is a ``{"": device}`` dict the entire
+    model stays on *device* (fast path for small models).
+    """
+    load_kwargs = dict(
+        dtype=dtype,
+        attn_implementation=attn_impl,
+        trust_remote_code=True,
+    )
+    if device_map is not None:
+        load_kwargs["device_map"] = device_map
+
+    print_on_local_main(
+        f"Loading target model from {model_name_or_path!r} "
+        f"(device_map={device_map!r}, dtype={dtype}, attn={attn_impl})..."
+    )
+    model = AutoModel.from_pretrained(model_name_or_path, **load_kwargs).eval()
+
+    # Freeze the entire model — we only need forward passes.
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    return model
+
+
+def _empty_device_cache(device: torch.device):
+    """Clear accelerator memory cache (NPU or CUDA)."""
+    if device.type == "npu":
+        torch.npu.empty_cache()
+    elif device.type == "cuda":
+        torch.cuda.empty_cache()
 
 
 def _get_target_backbone(target_model):
@@ -116,9 +182,17 @@ def run_target_forward_with_hooks(
     captured_hidden_states = {}
     handles = []
 
+    # When device_map="auto" shards layers across devices, each hook captures
+    # its tensor on the layer's host device.  We record the device of the
+    # first captured tensor and move everything there before concatenation.
+    _capture_device = [None]  # mutable container for the nested hook
+
     def capture_layer(layer_id: int):
         def hook(_module, _inputs, output):
-            captured_hidden_states[layer_id] = _get_hook_tensor(output)
+            tensor = _get_hook_tensor(output)
+            if _capture_device[0] is None:
+                _capture_device[0] = tensor.device
+            captured_hidden_states[layer_id] = tensor
 
         return hook
 
@@ -142,10 +216,15 @@ def run_target_forward_with_hooks(
                 use_cache=False,
             )
             target_last_hidden_states = target_output.last_hidden_state.detach()
-            target_hidden_states = torch.cat(
-                [captured_hidden_states[layer_id] for layer_id in target_layer_ids],
-                dim=-1,
-            )
+            # Move all captured tensors to a common device before concatenation.
+            common_device = _capture_device[0] or target_last_hidden_states.device
+            aligned = []
+            for layer_id in target_layer_ids:
+                t = captured_hidden_states[layer_id]
+                if t.device != common_device:
+                    t = t.to(device=common_device, non_blocking=True)
+                aligned.append(t)
+            target_hidden_states = torch.cat(aligned, dim=-1)
     finally:
         for handle in handles:
             handle.remove()
@@ -172,6 +251,18 @@ def parse_args():
     parser.add_argument("--max-shard-bytes", type=int, default=64 * 1024**3)
     parser.add_argument("--local-batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--device-map",
+        choices=["auto", "single"],
+        default=None,
+        help=(
+            "Device placement strategy for the target model. "
+            "'auto' uses accelerate to shard layers across all visible devices "
+            "(best for large models like DeepSeek-V4). "
+            "'single' loads the entire model onto one device. "
+            "Default: auto-detect based on model type."
+        ),
+    )
     cli_args = parser.parse_args()
     config = parse_opts_to_config(cli_args.opts, load_config(cli_args.config))
     return cli_args, config
@@ -275,22 +366,39 @@ def main():
         config.model.target_model_name_or_path,
         trust_remote_code=True,
     )
-    # DeepSeek-V4 (and other MLA / custom-attention models) require eager
-    # attention; SDPA does not support their attention patterns.
-    from transformers import AutoConfig
+
+    # Resolve model config (lightweight — no weights downloaded).
     _target_cfg = AutoConfig.from_pretrained(
         config.model.target_model_name_or_path,
         trust_remote_code=True,
     )
-    _attn = "sdpa"
-    if str(_target_cfg.model_type) in ("deepseek_v4",):
-        _attn = "eager"
-    target_model = AutoModel.from_pretrained(
-        config.model.target_model_name_or_path,
+    _model_type = str(_target_cfg.model_type)
+
+    # DeepSeek-V4 and other MLA / custom-attention models require eager
+    # attention; SDPA does not support their attention patterns.
+    _attn = "eager" if _model_type in ("deepseek_v4",) else "sdpa"
+
+    # Resolve device_map strategy and load directly onto NPU / GPU.
+    _device_map = _resolve_device_map(
+        model_type=_model_type,
+        cli_device_map=cli_args.device_map,
+        device=device,
+    )
+    if _device_map == "auto" and world_size > 1:
+        print_on_local_main(
+            "WARNING: device_map='auto' shards one model across all visible "
+            "devices.  Running more than one process per node "
+            f"(current world_size={world_size}) will cause each process to "
+            "compete for the same devices, likely OOMing.  "
+            "Re-launch with --nproc-per-node=1 to use layer-wise sharding, "
+            "or use --device-map single for data-parallel mode."
+        )
+    target_model = _load_target_model(
+        model_name_or_path=config.model.target_model_name_or_path,
         dtype=torch.bfloat16,
-        attn_implementation=_attn,
-        trust_remote_code=True,
-    ).to(device=device).eval()
+        attn_impl=_attn,
+        device_map=_device_map,
+    )
     target_hidden_size = _get_target_hidden_size(target_model)
     train_collator = ConversationCollator(
         tokenizer=tokenizer,
@@ -370,7 +478,7 @@ def main():
     finally:
         writer.close()
     del target_model
-    torch.cuda.empty_cache()
+    _empty_device_cache(device)
     dataset.close()
     summary = LocalCacheWriteSummary(
         global_rank=global_rank,
