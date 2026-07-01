@@ -1,4 +1,7 @@
 from deepspec.data import CacheCollator
+from deepspec.modeling.dspark.deepseek_v4.config import (
+    build_draft_config as build_deepseek_v4_draft_config,
+)
 from deepspec.modeling.dspark.gemma4 import Gemma4DSparkModel
 from deepspec.modeling.dspark.gemma4.config import (
     build_draft_config as build_gemma4_draft_config,
@@ -46,3 +49,19 @@ class Gemma4DSparkTrainer(Qwen3DSparkTrainer):
             model_args=model_args,
         )
         return Gemma4DSparkModel(draft_config)
+
+
+class DeepSeekV4DSparkTrainer(Qwen3DSparkTrainer):
+    """DSpark trainer for DeepSeek-V4 Flash as target model.
+
+    The draft model uses Qwen3-8B shapes for dense transformer compatibility
+    while keeping DeepSeek-V4's vocab_size (129280) and hidden_size (4096).
+    The embed_tokens and lm_head are copied from the DeepSeek-V4 target model.
+    """
+
+    def _build_draft_model(self, *, target_config, model_args):
+        draft_config = build_deepseek_v4_draft_config(
+            target_config=target_config,
+            model_args=model_args,
+        )
+        return Qwen3DSparkModel(draft_config)

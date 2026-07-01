@@ -60,6 +60,10 @@ def _get_target_backbone(target_model):
         if hasattr(target_model, "model") and hasattr(target_model.model, "language_model"):
             return target_model.model.language_model
         assert False, "Gemma4 target model must expose a text language_model."
+    # DeepSeek-V4 (and similar deepseek_v* models) expose the backbone
+    # as ``.model`` (a DeepseekV4Model).
+    if model_type in ("deepseek_v4",):
+        return target_model.model
     return getattr(target_model, "model", target_model)
 
 
@@ -71,13 +75,32 @@ def _get_target_hidden_size(target_model) -> int:
 
 
 def _get_hook_tensor(output):
+    """Extract a single (N, H) tensor from a layer output.
+
+    Handles two special cases:
+
+    * **Tuple output** (e.g. ``(hidden_states, residual)``): takes the first
+      element.
+    * **Hyper-connection output** (shape ``(N, hc_mult, H)``): mean-folds
+      the ``hc_mult`` dimension into a single ``(N, H)`` tensor.  This is
+      needed for DeepSeek-V4 and similar models that maintain multiple
+      residual streams.
+    """
     if isinstance(output, torch.Tensor):
-        return output
-    if isinstance(output, (tuple, list)) and output:
+        tensor = output
+    elif isinstance(output, (tuple, list)) and output:
         first = output[0]
         if isinstance(first, torch.Tensor):
-            return first
-    raise TypeError(f"Unsupported target hook output type: {type(output)!r}")
+            tensor = first
+        else:
+            raise TypeError(f"Unsupported target hook output type: {type(output)!r}")
+    else:
+        raise TypeError(f"Unsupported target hook output type: {type(output)!r}")
+
+    # Hyper-connection mean-folding: DeepSeek-V4 layers return (N, hc_mult, H).
+    if tensor.ndim == 3 and tensor.shape[1] > 1:
+        return tensor.mean(dim=1).detach()
+    return tensor.detach()
 
 
 def run_target_forward_with_hooks(
@@ -95,7 +118,7 @@ def run_target_forward_with_hooks(
 
     def capture_layer(layer_id: int):
         def hook(_module, _inputs, output):
-            captured_hidden_states[layer_id] = _get_hook_tensor(output).detach()
+            captured_hidden_states[layer_id] = _get_hook_tensor(output)
 
         return hook
 
@@ -250,11 +273,23 @@ def main(local_rank: int):
     local_subset = Subset(dataset, range(local_start, local_end))
     tokenizer = AutoTokenizer.from_pretrained(
         config.model.target_model_name_or_path,
+        trust_remote_code=True,
     )
+    # DeepSeek-V4 (and other MLA / custom-attention models) require eager
+    # attention; SDPA does not support their attention patterns.
+    from transformers import AutoConfig
+    _target_cfg = AutoConfig.from_pretrained(
+        config.model.target_model_name_or_path,
+        trust_remote_code=True,
+    )
+    _attn = "sdpa"
+    if str(_target_cfg.model_type) in ("deepseek_v4",):
+        _attn = "eager"
     target_model = AutoModel.from_pretrained(
         config.model.target_model_name_or_path,
         dtype=torch.bfloat16,
-        attn_implementation="sdpa",
+        attn_implementation=_attn,
+        trust_remote_code=True,
     ).to(device=device).eval()
     target_hidden_size = _get_target_hidden_size(target_model)
     train_collator = ConversationCollator(

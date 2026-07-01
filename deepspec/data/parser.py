@@ -50,6 +50,49 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
+# DeepSeek V4 Non-Think chat template.
+# Conversation format:
+#   <｜begin▁of▁sentence｜><｜User｜>user_msg<｜Assistant｜></think>assistant_msg<｜end▁of▁sentence｜>
+# The bos token is added automatically by the tokenizer (add_special_tokens).
+TEMPLATE_REGISTRY.register(
+    "deepseek",
+    ChatTemplate(
+        assistant_header="<｜Assistant｜></think>",
+        user_header="<｜User｜>",
+        system_prompt=None,
+        end_of_turn_token="<｜end▁of▁sentence｜>",
+    ),
+)
+
+# Jinja template for DeepSeek V4 tokenizer (Non-Think mode).
+# The tokenizer on HuggingFace does not ship with a chat_template, so we
+# provide one that matches the official encode_messages(thinking_mode="chat") output.
+DEEPSEEK_V4_CHAT_TEMPLATE = (
+    "{%- for message in messages %}"
+    "  {%- if message['role'] == 'user' %}"
+    "    {{- '<｜User｜>' + message['content'] -}}"
+    "  {%- elif message['role'] == 'assistant' %}"
+    "    {{- '<｜Assistant｜></think>' + message['content'] + '<｜end▁of▁sentence｜>' -}}"
+    "  {%- elif message['role'] == 'system' %}"
+    "    {{- message['content'] -}}"
+    "  {%- endif %}"
+    "{%- endfor %}"
+    "{%- if add_generation_prompt %}"
+    "  {{- '<｜Assistant｜></think>' -}}"
+    "{%- endif %}"
+)
+
+
+def set_tokenizer_chat_template(tokenizer, chat_template: str):
+    """Install a Jinja chat_template on *tokenizer* if it doesn't already have one.
+
+    DeepSeek-V4 and similar models ship without a chat_template. This helper
+    installs the Jinja template for the named DeepSpec chat template so that
+    ``tokenizer.apply_chat_template`` works.
+    """
+    if tokenizer.chat_template is None and chat_template == "deepseek":
+        tokenizer.chat_template = DEEPSEEK_V4_CHAT_TEMPLATE
+
 
 class GeneralParser:
     def __init__(self, tokenizer, chat_template):
@@ -210,6 +253,7 @@ def preprocess_record(
         template = TEMPLATE_REGISTRY.get(chat_template)
     except KeyError:
         assert False, f"Unknown chat template: {chat_template}"
+    set_tokenizer_chat_template(tokenizer, chat_template)
     parser = GeneralParser(tokenizer=tokenizer, chat_template=template)
     assert "conversations" in record, "Expected `conversations` field for JSONL records."
     return parser.parse(
