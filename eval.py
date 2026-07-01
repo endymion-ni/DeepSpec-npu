@@ -1,6 +1,7 @@
 from __future__ import annotations
 import argparse
 import json
+import os
 import torch
 from transformers import AutoConfig
 from deepspec.eval.dspark import Gemma4DSparkEvaluator, Qwen3DSparkEvaluator
@@ -47,19 +48,15 @@ def parse_args():
     return args
 
 
-def main(local_rank: int, args):
-    if local_rank == 0:
+def main():
+    args = parse_args()
+    if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(json.dumps(args, indent=4, cls=CustomJSONEncoder), flush=True)
     draft_config = AutoConfig.from_pretrained(args.draft_name_or_path)
     evaluator_cls = EVALUATORS[draft_config.architectures[0]]
-    evaluator = evaluator_cls(local_rank, args)
+    evaluator = evaluator_cls(args)
     evaluator.evaluate()
     evaluator.clean_up()
 
 if __name__ == "__main__":
-    args = parse_args()
-    torch.multiprocessing.spawn(
-        main,
-        args=(args,),
-        nprocs=torch.cuda.device_count(),
-    )
+    main()

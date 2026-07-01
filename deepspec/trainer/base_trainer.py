@@ -148,9 +148,9 @@ def _launch_eval(
 class BaseTrainer:
     data_collator_cls = None
 
-    def __init__(self, local_rank, args):
+    def __init__(self, args):
         self.args = args
-        self.device, self.global_rank, self.world_size = init_dist(local_rank)
+        self.device, self.global_rank, self.world_size = init_dist()
         self.precision_dtype = _PRECISION_DTYPES[self.args.train.precision]
         self.checkpoint_dir_root = self.args.logging.checkpoint_dir
         self.resume_checkpoint_dir = discover_latest_checkpoint(

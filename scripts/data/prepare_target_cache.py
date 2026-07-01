@@ -229,13 +229,13 @@ def _print_prepare_progress(*, global_rank: int, processed_samples: int, total_s
     )
 
 
-def main(local_rank: int):
+def main():
     cli_args, config = parse_args()
     train_data_paths = list(cli_args.train_data_path)
     target_layer_ids = [int(layer_id) for layer_id in config.model.target_layer_ids]
     min_loss_tokens = int(cli_args.min_loss_tokens)
     seed_all(int(config.seed))
-    device, global_rank, world_size = init_dist(local_rank)
+    device, global_rank, world_size = init_dist()
     output_dir = os.path.abspath(cli_args.output_dir)
     print_on_local_main(json.dumps(config, indent=4, cls=CustomJSONEncoder), flush=True)
     print_on_local_main(
@@ -434,4 +434,4 @@ if __name__ == "__main__":
     if os.path.exists(".git"):
         print(f"git status:", "\n\n".join(get_git_sha(detail_info=True)))
         print("git diff:", get_git_diff())
-    torch.multiprocessing.spawn(main, nprocs=torch.cuda.device_count())
+    main()

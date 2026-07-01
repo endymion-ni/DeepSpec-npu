@@ -28,12 +28,13 @@ def parse_args():
     return config
 
 
-def main(local_rank):
+def main():
     args = parse_args()
     seed_all(int(args.seed))
-    if local_rank == 0:
+    # Print config only on the local main process (torchrun sets LOCAL_RANK=0).
+    if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(json.dumps(args, indent=4, cls=CustomJSONEncoder), flush=True)
-    trainer = args.train.trainer_cls(local_rank, args)
+    trainer = args.train.trainer_cls(args)
     trainer.train()
     trainer.clean_up()
 
@@ -42,4 +43,4 @@ if __name__ == "__main__":
     if os.path.exists(".git"):
         print(f"git status:", "\n\n".join(get_git_sha(detail_info=True)))
         print("git diff:", get_git_diff())
-    torch.multiprocessing.spawn(main, nprocs=torch.cuda.device_count())
+    main()

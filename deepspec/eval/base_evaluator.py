@@ -443,9 +443,9 @@ def generate_decoding_sample(
 
 class BaseEvaluator:
 
-    def __init__(self, local_rank: int, args):
+    def __init__(self, args):
         self.args = args
-        self.device, self.global_rank, self.world_size = init_dist(local_rank)
+        self.device, self.global_rank, self.world_size = init_dist()
         self.tasks = args.tasks
 
         self.target_model, self.draft_model, self.tokenizer = self.build_models()

@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-model_path=Qwen/Qwen3-4B
-config_path=config/dspark/dspark_qwen3_4b.py
+# ---- model / paths ----
+# Override these defaults from the environment to switch target models.
+model_path=${MODEL_PATH:-deepseek-ai/DeepSeek-V4-Flash}
+config_path=${CONFIG_PATH:-config/dspark/dspark_deepseek_v4_flash.py}
 
 dataset_name=mlabonne/open-perfectblend
 test_size=0.05
 train_split_path=train_datasets/perfectblend_train.jsonl
 eval_data_dir=eval_datasets
 
-train_data_path=train_datasets/qwen3_4b/perfectblend_train_regen.jsonl
-cache_dir=${HOME}/.cache/deepspec/qwen3_4b_target_cache
+train_data_path=train_datasets/deepseek_v4/perfectblend_train_regen.jsonl
+cache_dir=${TARGET_CACHE_DIR:-${HOME}/.cache/deepspec/deepseek_v4_flash_target_cache}
 
 server_host=127.0.0.1
 num_workers=8
@@ -22,11 +24,17 @@ top_k=20
 min_p=0
 max_tokens=4096
 
+# ---- device selection ----
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
-export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
-export MASTER_PORT=${MASTER_PORT:-29500}
-export RANK=${RANK:-0}
-export WORLD_SIZE=${WORLD_SIZE:-1}
+export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES}}
+
+# Count devices for torchrun (NPU or CUDA).
+if python3 -c "import torch; torch.npu.is_available()" 2>/dev/null; then
+    NPROCS=$(python3 -c "import torch; print(torch.npu.device_count())")
+else
+    NPROCS=$(python3 -c "import torch; print(torch.cuda.device_count())")
+fi
+NPROCS=${NPROCS:-1}
 
 server_addresses=()
 for ((worker_id = 0; worker_id < num_workers; worker_id++)); do
@@ -43,8 +51,8 @@ python scripts/data/download_and_split.py \
 
 mkdir -p "$(dirname "${train_data_path}")"
 
-echo "Step 2/3: generating Qwen3-4B train data: ${train_data_path}"
-echo "Start sglang first with: bash scripts/data/launch_sglang_server.sh"
+echo "Step 2/3: generating train data (${model_path}): ${train_data_path}"
+echo "Start inference server first."
 python scripts/data/generate_train_data.py \
     --model "${model_path}" \
     --server-address "${server_addresses[@]}" \
@@ -59,9 +67,11 @@ python scripts/data/generate_train_data.py \
     --input-file-path "${train_split_path}" \
     --output-file-path "${train_data_path}"
 
-echo "Stop sglang before Step 3 if it is using the same GPUs."
-echo "Step 3/3: preparing Qwen3-4B target cache: ${cache_dir}"
-python scripts/data/prepare_target_cache.py \
+echo "Stop inference server before Step 3 if it is using the same devices."
+echo "Step 3/3: preparing target cache: ${cache_dir}"
+torchrun \
+    --nproc-per-node="${NPROCS}" \
+    scripts/data/prepare_target_cache.py \
     --config "${config_path}" \
     --train-data-path "${train_data_path}" \
     --output-dir "${cache_dir}" \
