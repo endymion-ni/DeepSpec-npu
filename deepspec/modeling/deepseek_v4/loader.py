@@ -1,18 +1,23 @@
-"""Load DeepSeek-V4 Transformer from ``inference/model.py`` with BF16 weights.
+"""Load DeepSeek-V4 ``inference/model.py`` Transformer with BF16 weights.
 
-Patches ``sys.modules["kernel"]`` with a CPU fallback so that the model can
-run without the tilelang CUDA kernels.  FP8 / FP4 weights are dequantised
-to BF16 during loading, which means the ``linear()`` dispatcher inside
-``inference/model.py`` always takes the plain ``F.linear`` path.
+Reference: ``cann-recipes-infer/models/deepseek-v4/utils/convert_model.py``
+
+Strategy (mirrors cann-recipes-infer):
+1. Single-pass read of all safetensors into memory.
+2. FP8 / FP4 → BF16 dequantisation using per-block ``weight * scale``.
+3. Minimal name mapping: checkpoint uses ``attn.wq_a`` / ``ffn.experts.{e}.w1``
+   while ``inference/model.py`` uses ``attention.wq_a`` / ``feed_forward.experts.*.gate_up_proj``.
+4. ``sys.modules["kernel"]`` is patched with CPU fallbacks so the model runs
+   without tilelang CUDA kernels.
 """
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import sys
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Iterator
 
 import torch
@@ -20,222 +25,358 @@ import torch.nn.functional as F
 from safetensors import safe_open
 
 # ---------------------------------------------------------------------------
-# Constants (must match inference/model.py)
+# Constants
 # ---------------------------------------------------------------------------
 FP8_BLOCK_SIZE = 128
-FP4_BLOCK_SIZE = 32
-
-# FP4 lookup table (from inference/convert.py)
-FP4_TABLE = torch.tensor(
-    [
-        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-        0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
-    ],
-    dtype=torch.float32,
-)
 
 
 # ---------------------------------------------------------------------------
-# Weight dequantisation helpers
+# Weight dequantisation  (adapted from cann-recipes-infer convert_model.py)
 # ---------------------------------------------------------------------------
 
-def _dequant_fp8_weight(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """Dequantise an FP8-e4m3 weight with per-128-block E8M0 scale → BF16.
+def weight_dequant(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    block_size: int = FP8_BLOCK_SIZE,
+) -> torch.Tensor:
+    """Dequantise FP8-e4m3 weight with per-block E8M0 scale → BF16.
 
-    *weight*  : (out_features, in_features)   float8_e4m3fn
-    *scale*   : (ceil(out/128), ceil(in/128)) float8_e8m0fnu  (power-of-2)
+    Mirrors ``cann-recipes-infer/utils/convert_model.py:weight_dequant``.
+
+    Args:
+        weight: (M, N)  float8_e4m3fn
+        scale:  (ceil(M/block), ceil(N/block))  float8_e8m0fnu (power-of-2)
+        block_size: typically 128
+
+    Returns:
+        (M, N)  bfloat16
     """
-    out_dim, in_dim = weight.shape
-    b_out = (out_dim + FP8_BLOCK_SIZE - 1) // FP8_BLOCK_SIZE
-    b_in = (in_dim + FP8_BLOCK_SIZE - 1) // FP8_BLOCK_SIZE
-
-    # Pad scale to full block grid if needed
-    s = scale.float()[:b_out, :b_in]
-
-    # Expand scale to (out_dim, in_dim) via nearest-neighbour
-    s = s.repeat_interleave(FP8_BLOCK_SIZE, dim=0)[:out_dim]
-    s = s.repeat_interleave(FP8_BLOCK_SIZE, dim=1)[:in_dim]
-
-    return (weight.float() * s).to(torch.bfloat16)
-
-
-def _dequant_fp4_weight(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """Dequantise an FP4-e2m1 weight with per-32-block E8M0 scale → BF16.
-
-    *weight*  : (out_features, in_features//2)  float4_e2m1fn_x2  (packed)
-    *scale*   : (out_features, ceil(in/32))     float8_e8m0fnu
-    """
-    out_dim = weight.shape[0]
-    logical_in_dim = weight.shape[1] * 2  # packed: 2 FP4 values per byte
-
-    # Unpack FP4: each uint8 contains two 4-bit values
-    w_u8 = weight.view(torch.uint8)
-    low = w_u8 & 0x0F
-    high = (w_u8 >> 4) & 0x0F
-    w_decomp = torch.stack(
-        [FP4_TABLE[low.long()], FP4_TABLE[high.long()]], dim=-1
-    ).flatten(1)  # (out_dim, logical_in_dim)
-
-    # Expand scale
+    M, N = weight.shape
+    w = weight.float()
     s = scale.float()
-    s = s.repeat_interleave(FP4_BLOCK_SIZE, dim=1)[:, :logical_in_dim]
 
-    return (w_decomp * s).to(torch.bfloat16)
+    scale_m, scale_n = s.shape
+    assert scale_m == (M + block_size - 1) // block_size, (
+        f"scale rows mismatch: {scale_m} vs {(M + block_size - 1) // block_size}"
+    )
+    assert scale_n == (N + block_size - 1) // block_size, (
+        f"scale cols mismatch: {scale_n} vs {(N + block_size - 1) // block_size}"
+    )
+
+    # Expand scale to full weight shape
+    s_expanded = s.repeat_interleave(block_size, dim=0).repeat_interleave(
+        block_size, dim=1
+    )[:M, :N]
+
+    return (w * s_expanded).to(torch.bfloat16)
 
 
 # ---------------------------------------------------------------------------
-# Name mapping: checkpoint key → model state_dict key
+# Iterate safetensors
 # ---------------------------------------------------------------------------
 
-def _map_ckpt_key_to_model(ckpt_key: str) -> str | None:
-    """Convert a checkpoint tensor name to a ``Transformer`` state_dict key.
+def _iter_safetensors(model_dir: str) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield (key, tensor) from all ``*.safetensors`` in *model_dir*."""
+    shards = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
+    if not shards:
+        raise FileNotFoundError(f"No safetensors files in {model_dir}")
+    for shard_path in shards:
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                yield key, f.get_tensor(key)
 
-    Returns ``None`` for keys that should be skipped (e.g. MTP weights).
+
+# ---------------------------------------------------------------------------
+# Name mapping: checkpoint native → inference/model.py attribute path
+# ---------------------------------------------------------------------------
+
+def _map_ckpt_to_model(ckpt_key: str) -> str | None:
+    """Map a checkpoint tensor key to ``Transformer`` state_dict key.
+
+    Checkpoint naming (native DeepSeek)::
+
+        embed.weight
+        layers.{i}.attn.wq_a.weight     / .scale
+        layers.{i}.attn.wo_b.weight      / .scale
+        layers.{i}.attn.wkv.weight       / .scale
+        layers.{i}.attn.attn_sink
+        layers.{i}.attn.q_norm.weight
+        layers.{i}.attn.kv_norm.weight
+        layers.{i}.attn.compressor.*
+        layers.{i}.attn.indexer.*
+        layers.{i}.ffn.gate.weight
+        layers.{i}.ffn.experts.{e}.w{1,2,3}.weight  / .scale
+        layers.{i}.ffn.shared_experts.w{1,2,3}.weight / .scale
+        layers.{i}.attn_norm.weight
+        layers.{i}.ffn_norm.weight
+        layers.{i}.hc_attn_{fn,base,scale}
+        layers.{i}.hc_ffn_{fn,base,scale}
+        norm.weight
+        head.weight
+        hc_head_{fn,base,scale}
+
+    ``inference/model.py`` naming::
+
+        layers.{i}.attention.*   (instead of layers.{i}.attn.*)
+        layers.{i}.feed_forward.* (instead of layers.{i}.ffn.*)
+        layers.{i}.attn_norm.*   (same)
+        layers.{i}.ffn_norm.*    (same)
+        layers.{i}.attn_hc.*     (hc_attn_* → attn_hc.*)
+        layers.{i}.ffn_hc.*      (hc_ffn_* → ffn_hc.*)
+        embed.*  (same)
+        head.*   (same)
+        norm.*   (same)
+        hc_head_* (same)
     """
-    # Skip MTP layers entirely
     if ckpt_key.startswith("mtp."):
-        return None
+        return None  # skip MTP
 
-    key = ckpt_key
+    # --- Top-level ---
+    if not ckpt_key.startswith("layers."):
+        # embed, head, norm, hc_head_*
+        return ckpt_key  # identities
 
-    # Embed / head / norm (top-level)
-    if key == "embed.weight":
-        return "embed.weight"
-    if key == "head.weight":
-        return "head.weight"
-    if key == "norm.weight":
-        return "norm.weight"
+    # --- Layer keys ---
+    parts = ckpt_key.split(".")
+    layer_idx = parts[1]  # keep as string
+    rest = ".".join(parts[2:])
 
-    # Hyper-connection head parameters
-    if key == "hc_head_fn":
-        return "hc_head_fn"
-    if key == "hc_head_base":
-        return "hc_head_base"
-    if key == "hc_head_scale":
-        return "hc_head_scale"
+    # attn → attention
+    if rest.startswith("attn."):
+        rest = "attention." + rest[5:]
+    # ffn → feed_forward
+    elif rest.startswith("ffn."):
+        rest = "feed_forward." + rest[4:]
+    # hc_attn_* → attn_hc.*
+    elif rest.startswith("hc_attn_"):
+        param = rest[8:]  # fn / base / scale
+        rest = f"attn_hc.{param}"
+    # hc_ffn_* → ffn_hc.*
+    elif rest.startswith("hc_ffn_"):
+        param = rest[7:]  # fn / base / scale
+        rest = f"ffn_hc.{param}"
 
-    # Layer-specific keys: layers.{i}.{rest}
-    if key.startswith("layers."):
-        parts = key.split(".")
-        layer_idx = int(parts[1])
-        rest = ".".join(parts[2:])  # e.g. "attn.wq_a.weight"
-
-        # --- Attention ---
-        if rest.startswith("attn."):
-            sub = rest[5:]  # strip "attn."
-            # Linear weights: wq_a, wq_b, wo_a, wo_b, wkv
-            for lin_name in ("wq_a", "wq_b", "wo_a", "wo_b", "wkv"):
-                if sub == f"{lin_name}.weight":
-                    return f"layers.{layer_idx}.attention.{lin_name}.weight"
-                if sub == f"{lin_name}.scale":
-                    return f"layers.{layer_idx}.attention.{lin_name}.scale"
-            # Norms
-            if sub == "q_norm.weight":
-                return f"layers.{layer_idx}.attention.q_norm.weight"
-            if sub == "kv_norm.weight":
-                return f"layers.{layer_idx}.attention.kv_norm.weight"
-            # attn_sink
-            if sub == "attn_sink":
-                return f"layers.{layer_idx}.attention.attn_sink"
-            # Compressor / indexer weights (sparse layers)
-            if sub.startswith("compressor."):
-                return f"layers.{layer_idx}.attention.{sub}"
-            if sub.startswith("indexer."):
-                return f"layers.{layer_idx}.attention.{sub}"
-            # CSA / HCA compressor weights
-            if "weights_proj" in sub:
-                return f"layers.{layer_idx}.attention.{sub}"
-            # Unknown attention key — warn and skip
-            print(f"[loader] WARNING: unknown attention key: {ckpt_key}")
-            return None
-
-        # --- FFN ---
-        if rest.startswith("ffn."):
-            sub = rest[4:]  # strip "ffn."
-
-            # Router gate
-            if sub == "gate.weight":
-                return f"layers.{layer_idx}.feed_forward.gate.weight"
-
-            # Shared experts (DeepseekV4MLP)
-            if sub.startswith("shared_experts."):
-                se_rest = sub[16:]  # strip "shared_experts."
-                # w1 + w3 → gate_up_proj (need special handling)
-                if se_rest in ("w1.weight", "w3.weight"):
-                    return None  # handled by _merge_gate_up
-                if se_rest in ("w1.scale", "w3.scale"):
-                    return None  # handled by _merge_gate_up
-                if se_rest == "w2.weight":
-                    return f"layers.{layer_idx}.feed_forward.shared_experts.down_proj.weight"
-                if se_rest == "w2.scale":
-                    return f"layers.{layer_idx}.feed_forward.shared_experts.down_proj.scale"
-                return None
-
-            # Routed experts
-            if sub.startswith("experts."):
-                exp_parts = sub.split(".")
-                exp_idx = int(exp_parts[1])
-                exp_rest = ".".join(exp_parts[2:])  # w1.weight / w1.scale / etc.
-
-                # w1 + w3 → gate_up_proj (stacked across experts)
-                if exp_rest in ("w1.weight", "w3.weight"):
-                    return None  # handled by _merge_gate_up
-                if exp_rest in ("w1.scale", "w3.scale"):
-                    return None  # handled by _merge_gate_up
-                if exp_rest == "w2.weight":
-                    return f"layers.{layer_idx}.feed_forward.experts.down_proj.weight"
-                if exp_rest == "w2.scale":
-                    return f"layers.{layer_idx}.feed_forward.experts.down_proj.scale"
-                return None
-
-            return None
-
-        # --- Hyper-connections ---
-        if rest in ("hc_attn_fn", "hc_attn_base", "hc_attn_scale"):
-            param = rest[3:]  # "attn_fn" → "fn", "attn_base" → "base", "attn_scale" → "scale"
-            hc_attr = {"attn_fn": "fn", "attn_base": "base", "attn_scale": "scale"}[param]
-            return f"layers.{layer_idx}.attn_hc.{hc_attr}"
-        if rest in ("hc_ffn_fn", "hc_ffn_base", "hc_ffn_scale"):
-            param = {"hc_ffn_fn": "fn", "hc_ffn_base": "base", "hc_ffn_scale": "scale"}[rest]
-            return f"layers.{layer_idx}.ffn_hc.{param}"
-
-        # --- Norms ---
-        if rest == "attn_norm.weight":
-            return f"layers.{layer_idx}.attn_norm.weight"
-        if rest == "ffn_norm.weight":
-            return f"layers.{layer_idx}.ffn_norm.weight"
-
-        # Unknown layer key
-        print(f"[loader] WARNING: unknown layer key: {ckpt_key}")
-        return None
-
-    # Unknown top-level key
-    print(f"[loader] WARNING: unknown key: {ckpt_key}")
-    return None
+    return f"layers.{layer_idx}.{rest}"
 
 
 # ---------------------------------------------------------------------------
-# Model loader
+# Expert w1/w3 → gate_up_proj merging
+# ---------------------------------------------------------------------------
+
+def _merge_expert_weights(raw: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Merge per-expert ``w1`` + ``w3`` → ``gate_up_proj`` for all layers.
+
+    The checkpoint stores expert weights as separate tensors::
+
+        layers.{i}.ffn.experts.{e}.w1.weight  (intermediate, hidden)
+        layers.{i}.ffn.experts.{e}.w3.weight  (intermediate, hidden)
+
+    ``inference/model.py`` expects a fused stacked tensor::
+
+        layers.{i}.feed_forward.experts.gate_up_proj:
+            (n_experts, 2 * intermediate, hidden)
+
+    Shared experts are merged similarly.
+    """
+    # Collect per-layer expert w1/w3
+    expert_w1: dict[int, dict[int, torch.Tensor]] = {}
+    expert_w3: dict[int, dict[int, torch.Tensor]] = {}
+    shared_w1: dict[int, torch.Tensor] = {}
+    shared_w3: dict[int, torch.Tensor] = {}
+    n_experts: dict[int, int] = {}
+
+    merged = {}
+
+    for ckpt_key, tensor in raw.items():
+        # Routed experts
+        if ".ffn.experts." in ckpt_key and (
+            ckpt_key.endswith(".w1.weight") or ckpt_key.endswith(".w3.weight")
+        ):
+            parts = ckpt_key.split(".")
+            layer_idx = int(parts[1])
+            exp_idx = int(parts[4])
+            is_w3 = parts[5] == "w3"
+            n_experts[layer_idx] = max(n_experts.get(layer_idx, 0), exp_idx + 1)
+            t = _dequant_if_needed(ckpt_key, tensor, raw)
+            if is_w3:
+                expert_w3.setdefault(layer_idx, {})[exp_idx] = t
+            else:
+                expert_w1.setdefault(layer_idx, {})[exp_idx] = t
+            continue
+
+        # Shared experts
+        if ".ffn.shared_experts." in ckpt_key and (
+            ckpt_key.endswith(".w1.weight") or ckpt_key.endswith(".w3.weight")
+        ):
+            parts = ckpt_key.split(".")
+            layer_idx = int(parts[1])
+            is_w3 = parts[4] == "w3"
+            t = _dequant_if_needed(ckpt_key, tensor, raw)
+            if is_w3:
+                shared_w3[layer_idx] = t
+            else:
+                shared_w1[layer_idx] = t
+            continue
+
+    # Merge routed experts
+    for layer_idx in sorted(expert_w1.keys()):
+        n_exp = n_experts[layer_idx]
+        gate_up = torch.stack([
+            torch.cat([expert_w1[layer_idx][e], expert_w3[layer_idx][e]], dim=0)
+            for e in range(n_exp)
+        ])
+        merged[f"layers.{layer_idx}.feed_forward.experts.gate_up_proj"] = gate_up
+
+    # Merge shared experts
+    for layer_idx in sorted(shared_w1.keys()):
+        gate_up = torch.cat([shared_w1[layer_idx], shared_w3[layer_idx]], dim=0)
+        merged[f"layers.{layer_idx}.feed_forward.shared_experts.gate_up_proj"] = gate_up
+
+    return merged
+
+
+def _dequant_if_needed(
+    ckpt_key: str, tensor: torch.Tensor, raw: dict[str, torch.Tensor]
+) -> torch.Tensor:
+    """Dequantise FP8 → BF16 if the tensor is quantised."""
+    if tensor.dtype == torch.float8_e4m3fn:
+        scale_key = ckpt_key.replace(".weight", ".scale")
+        scale = raw.get(scale_key)
+        if scale is not None:
+            return weight_dequant(tensor, scale)
+    return tensor.to(torch.bfloat16)
+
+
+# ---------------------------------------------------------------------------
+# Main weight loading
+# ---------------------------------------------------------------------------
+
+def _load_weights(model: torch.nn.Module, model_dir: str) -> None:
+    """Dequantise and load all weights from *model_dir* into *model*.
+
+    Single-pass: read all shards once → process → ``load_state_dict``.
+    """
+    # 1. Read everything into memory
+    raw: dict[str, torch.Tensor] = {}
+    for ckpt_key, tensor in _iter_safetensors(model_dir):
+        raw[ckpt_key] = tensor
+
+    # 2. Merge expert weights (consumes expert w1/w3 keys)
+    state_dict = _merge_expert_weights(raw)
+
+    # 3. Process remaining keys
+    for ckpt_key, tensor in raw.items():
+        if ckpt_key.startswith("mtp."):
+            continue
+        if ckpt_key.endswith(".scale"):
+            continue  # handled with weight
+
+        model_key = _map_ckpt_to_model(ckpt_key)
+        if model_key is None:
+            continue
+
+        # Skip expert w1/w3 — already merged
+        if (
+            ".ffn.experts." in ckpt_key
+            or ".ffn.shared_experts." in ckpt_key
+        ) and (ckpt_key.endswith(".w1.weight") or ckpt_key.endswith(".w3.weight")):
+            continue
+        # Map w2.weight to down_proj.weight
+        if ".ffn.experts." in ckpt_key and ckpt_key.endswith(".w2.weight"):
+            model_key = model_key.replace("feed_forward.experts.w2.weight",
+                                          "feed_forward.experts.down_proj.weight")
+        if ".ffn.shared_experts." in ckpt_key and ckpt_key.endswith(".w2.weight"):
+            model_key = model_key.replace("feed_forward.shared_experts.w2.weight",
+                                          "feed_forward.shared_experts.down_proj.weight")
+
+        state_dict[model_key] = _dequant_if_needed(ckpt_key, tensor, raw)
+
+    # 4. Load
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        n = min(5, len(missing))
+        print(f"[loader] {len(missing)} missing keys (first {n}: {missing[:n]})")
+    if unexpected:
+        n = min(5, len(unexpected))
+        print(f"[loader] {len(unexpected)} unexpected keys (first {n}: {unexpected[:n]})")
+
+
+# ---------------------------------------------------------------------------
+# Public API
 # ---------------------------------------------------------------------------
 
 @dataclass
 class LoadedDeepSeekV4Model:
-    """Container for a loaded Transformer and its metadata."""
-
-    model: torch.nn.Module    # the Transformer instance
-    config: dict              # raw config.json
-    model_args: object        # ModelArgs dataclass
+    model: torch.nn.Module
+    config: dict
+    model_args: object
     hc_mult: int
     n_layers: int
     hidden_size: int
 
 
-def _parse_model_args(config: dict) -> object:
-    """Build a ``ModelArgs`` instance from the raw config dict."""
+def load_model(
+    model_dir: str,
+    *,
+    device: torch.device | None = None,
+) -> LoadedDeepSeekV4Model:
+    """Load DeepSeek-V4 ``Transformer`` in BF16 inference mode.
+
+    1. Patch ``sys.modules["kernel"]`` → CPU fallback.
+    2. Parse ``ModelArgs`` from ``config.json``.
+    3. Instantiate ``Transformer``.
+    4. Dequantise and load all weights.
+    5. Move to *device* (CPU if ``None``).
+    """
+    from deepspec.modeling.deepseek_v4 import kernel_cpu
+    sys.modules["kernel"] = kernel_cpu
+
+    # Add inference dir to path
+    inference_dir = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..",
+                     "models", "deepseek_v4_flash_hf_config", "inference")
+    )
+    if inference_dir not in sys.path:
+        sys.path.insert(0, inference_dir)
+    import model as ds_model
+
+    # Config
+    config_path = os.path.join(model_dir, "config.json")
+    if not os.path.exists(config_path):
+        config_path = os.path.join(os.path.dirname(inference_dir), "config.json")
+    with open(config_path) as f:
+        config = json.load(f)
+
+    # ModelArgs (mirrors cann-recipes-infer parse)
+    model_args = _build_model_args(config)
+
+    print(f"[loader] Transformer(n_layers={model_args.n_layers}, "
+          f"vocab={model_args.vocab_size}, dim={model_args.dim})")
+    transformer = ds_model.Transformer(model_args)
+
+    print(f"[loader] Loading + dequantising weights from {model_dir}")
+    _load_weights(transformer, model_dir)
+
+    if device is not None:
+        transformer = transformer.to(device)
+
+    transformer.eval()
+    for p in transformer.parameters():
+        p.requires_grad_(False)
+
+    return LoadedDeepSeekV4Model(
+        model=transformer, config=config, model_args=model_args,
+        hc_mult=model_args.hc_mult, n_layers=model_args.n_layers,
+        hidden_size=model_args.dim,
+    )
+
+
+def _build_model_args(config: dict):
+    """Build ``ModelArgs`` from config.json."""
     from models.deepseek_v4_flash_hf_config.inference.model import ModelArgs
 
-    # Map config.json keys to ModelArgs fields
-    field_map = {
+    # Direct 1:1 mappings
+    direct = {
         "vocab_size": "vocab_size",
         "dim": "dim",
         "n_layers": "n_layers",
@@ -253,9 +394,6 @@ def _parse_model_args(config: dict) -> object:
         "window_size": "sliding_window",
         "compress_rope_theta": "compress_rope_theta",
         "rope_theta": "rope_theta",
-        "rope_factor": ("rope_parameters", "main", "factor"),
-        "beta_fast": ("rope_parameters", "main", "beta_fast"),
-        "beta_slow": ("rope_parameters", "main", "beta_slow"),
         "index_n_heads": "index_n_heads",
         "index_head_dim": "index_head_dim",
         "index_topk": "index_topk",
@@ -265,209 +403,31 @@ def _parse_model_args(config: dict) -> object:
         "n_hash_layers": "n_hash_layers",
         "n_mtp_layers": "num_nextn_predict_layers",
     }
-
     kwargs = {}
-    for model_arg_name, cfg_key in field_map.items():
-        if isinstance(cfg_key, tuple):
-            # Nested access
-            val = config
-            for k in cfg_key:
-                val = val.get(k, {}) if isinstance(val, dict) else getattr(val, k, None)
-        else:
-            val = config.get(cfg_key)
-        if val is not None:
-            kwargs[model_arg_name] = val
+    for ma, ck in direct.items():
+        if ck in config:
+            kwargs[ma] = config[ck]
 
-    # Hard-code inference mode
+    # Nested: rope_factor / beta_fast / beta_slow
+    rp = config.get("rope_parameters", {}).get("main", {})
+    for k in ("factor", "beta_fast", "beta_slow"):
+        if k in rp:
+            kwargs[f"rope_{k}"] = rp[k]
+
     kwargs.setdefault("max_seq_len", config.get("max_position_embeddings", 4096))
-    kwargs.setdefault("dtype", "bf16")  # Force BF16 to avoid FP8 kernels
+    kwargs.setdefault("dtype", "bf16")  # force BF16 path
 
     return ModelArgs(**kwargs)
 
 
-def _iter_safetensors(model_dir: str) -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield (key, tensor) pairs from all safetensors shards in *model_dir*."""
-    import glob
-
-    shards = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
-    if not shards:
-        raise FileNotFoundError(f"No safetensors files in {model_dir}")
-    for shard_path in shards:
-        with safe_open(shard_path, framework="pt", device="cpu") as f:
-            for key in f.keys():
-                yield key, f.get_tensor(key)
-
-
-def _load_weights_into_model(model: torch.nn.Module, model_dir: str) -> None:
-    """Load and dequantise weights from *model_dir* into *model*.
-
-    Single-pass over all safetensors shards:
-    1. Collect every (ckpt_key, tensor) pair.
-    2. Dequantise FP8 / FP4 → BF16, pairing weights with their scales.
-    3. Merge per-expert w1 + w3 → stacked gate_up_proj.
-    4. ``model.load_state_dict(...)``.
-    """
-    raw: dict[str, torch.Tensor] = {}
-    for ckpt_key, tensor in _iter_safetensors(model_dir):
-        raw[ckpt_key] = tensor
-
-    state_dict: dict[str, torch.Tensor] = {}
-    expert_w1: dict[int, dict[int, torch.Tensor]] = {}
-    expert_w3: dict[int, dict[int, torch.Tensor]] = {}
-    shared_w1: dict[int, torch.Tensor] = {}
-    shared_w3: dict[int, torch.Tensor] = {}
-    n_experts: dict[int, int] = {}
-
-    for ckpt_key, tensor in raw.items():
-        if ckpt_key.startswith("mtp."):
-            continue  # skip MTP
-
-        # ---- expert w1 / w3 (defer to merge pass) ----
-        if ".ffn.experts." in ckpt_key and (".w1." in ckpt_key or ".w3." in ckpt_key):
-            parts = ckpt_key.split(".")
-            layer_idx = int(parts[1])
-            exp_idx = int(parts[4])
-            w_idx = parts[5]  # "w1" or "w3"
-            n_experts[layer_idx] = max(n_experts.get(layer_idx, 0), exp_idx + 1)
-
-            scale_key = ckpt_key.replace(".weight", ".scale")
-            scale = raw.get(scale_key)
-            t = _dequant_fp8_weight(tensor, scale) if scale is not None and tensor.dtype == torch.float8_e4m3fn else tensor.to(torch.bfloat16)
-
-            if w_idx == "w1":
-                expert_w1.setdefault(layer_idx, {})[exp_idx] = t
-            else:
-                expert_w3.setdefault(layer_idx, {})[exp_idx] = t
-            continue
-
-        if ".ffn.shared_experts." in ckpt_key and (".w1." in ckpt_key or ".w3." in ckpt_key):
-            parts = ckpt_key.split(".")
-            layer_idx = int(parts[1])
-            w_idx = parts[4]
-            scale_key = ckpt_key.replace(".weight", ".scale")
-            scale = raw.get(scale_key)
-            t = _dequant_fp8_weight(tensor, scale) if scale is not None and tensor.dtype == torch.float8_e4m3fn else tensor.to(torch.bfloat16)
-            if w_idx == "w1":
-                shared_w1[layer_idx] = t
-            else:
-                shared_w3[layer_idx] = t
-            continue
-
-        # ---- scale tensors (handled with weight) ----
-        if tensor.dtype == torch.float8_e8m0fnu:
-            continue
-
-        # ---- map & dequantise ----
-        model_key = _map_ckpt_key_to_model(ckpt_key)
-        if model_key is None:
-            continue
-
-        if tensor.dtype == torch.float8_e4m3fn:
-            scale_key = ckpt_key.replace(".weight", ".scale")
-            scale = raw.get(scale_key)
-            state_dict[model_key] = _dequant_fp8_weight(tensor, scale) if scale is not None else tensor.to(torch.bfloat16)
-        elif tensor.dtype == torch.float4_e2m1fn_x2:
-            scale_key = ckpt_key.replace(".weight", ".scale")
-            scale = raw.get(scale_key)
-            state_dict[model_key] = _dequant_fp4_weight(tensor, scale) if scale is not None else tensor.to(torch.bfloat16)
-        else:
-            state_dict[model_key] = tensor.to(torch.bfloat16)
-
-    # ---- Merge routed experts: w1 + w3 → gate_up_proj ----
-    for layer_idx in sorted(expert_w1.keys()):
-        n_exp = n_experts[layer_idx]
-        w1_list = [expert_w1[layer_idx][e] for e in range(n_exp)]
-        w3_list = [expert_w3[layer_idx][e] for e in range(n_exp)]
-        gate_up = torch.stack([torch.cat([a, b], dim=0) for a, b in zip(w1_list, w3_list)])
-        state_dict[f"layers.{layer_idx}.feed_forward.experts.gate_up_proj"] = gate_up
-
-    for layer_idx in sorted(shared_w1.keys()):
-        gate_up = torch.cat([shared_w1[layer_idx], shared_w3[layer_idx]], dim=0)
-        state_dict[f"layers.{layer_idx}.feed_forward.shared_experts.gate_up_proj"] = gate_up
-
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-
-
-def load_model(
-    model_dir: str,
-    *,
-    device: torch.device | None = None,
-) -> LoadedDeepSeekV4Model:
-    """Load the DeepSeek-V4 Transformer from *model_dir* in BF16 inference mode.
-
-    1. Patches ``sys.modules["kernel"]`` → CPU fallback.
-    2. Instantiates ``Transformer`` with ``ModelArgs`` from ``config.json``.
-    3. Loads and dequantises all weights.
-    4. Moves the model to *device* (CPU if ``None``).
-    """
-    # Patch kernel BEFORE importing model
-    from deepspec.modeling.deepseek_v4 import kernel_cpu
-
-    sys.modules["kernel"] = kernel_cpu
-
-    # Add inference dir to path so model.py can be imported
-    inference_dir = os.path.join(
-        os.path.dirname(__file__), "..", "..", "..",
-        "models", "deepseek_v4_flash_hf_config", "inference",
-    )
-    inference_dir = os.path.abspath(inference_dir)
-    if inference_dir not in sys.path:
-        sys.path.insert(0, inference_dir)
-
-    # Now import the model module
-    import model as ds_model  # noqa: E402  (inference/model.py)
-
-    # Load config
-    config_path = os.path.join(model_dir, "config.json")
-    if not os.path.exists(config_path):
-        # Try the repo-local copy
-        config_path = os.path.join(
-            os.path.dirname(inference_dir), "config.json"
-        )
-    with open(config_path) as f:
-        config = json.load(f)
-
-    # Build ModelArgs
-    model_args = _parse_model_args(config)
-
-    # Instantiate
-    print(f"[loader] Instantiating Transformer (dtype=bf16, n_layers={model_args.n_layers})")
-    transformer = ds_model.Transformer(model_args)
-
-    # Load weights
-    print(f"[loader] Loading weights from {model_dir}")
-    _load_weights_into_model(transformer, model_dir)
-
-    # Move to device
-    if device is not None:
-        transformer = transformer.to(device)
-
-    transformer.eval()
-    for p in transformer.parameters():
-        p.requires_grad_(False)
-
-    return LoadedDeepSeekV4Model(
-        model=transformer,
-        config=config,
-        model_args=model_args,
-        hc_mult=model_args.hc_mult,
-        n_layers=model_args.n_layers,
-        hidden_size=model_args.dim,
-    )
-
-
 # ---------------------------------------------------------------------------
-# Hidden-state extraction hooks
+# Hidden-state extraction
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class ExtractedHiddenStates:
-    """Hidden states captured during one forward pass."""
-
-    # (seq_len, num_target_layers * hidden_size) — concatenated mid-layer outputs
-    target_hidden_states: torch.Tensor
-    # (seq_len, hidden_size) — hc_head output (before norm)
-    target_last_hidden_states: torch.Tensor
+    target_hidden_states: torch.Tensor       # (seq, n_layers * hidden)
+    target_last_hidden_states: torch.Tensor  # (seq, hidden)
 
 
 def extract_hidden_states(
@@ -475,74 +435,43 @@ def extract_hidden_states(
     input_ids: torch.Tensor,
     target_layer_ids: list[int],
 ) -> ExtractedHiddenStates:
-    """Run one forward pass and capture hidden states at *target_layer_ids*.
+    """Forward pass with hooks at *target_layer_ids*.
 
-    For each layer in *target_layer_ids*, the 4-stream hyper-connection output
-    ``(seq, hc_mult, hidden)`` is mean-folded into ``(seq, hidden)``.
-    The hc_head collapsed output (before final norm) serves as the "last"
-    hidden state.
+    Hooked layer output ``(N, hc_mult, hidden)`` is mean-folded → ``(N, hidden)``.
+    The hc_head collapsed state (pre-norm) is the "last" hidden state.
     """
     transformer = model_loaded.model
     device = input_ids.device
     captured = {}
-
-    # --- Register forward hooks on target layers ---
     handles = []
 
-    def make_hook(layer_id: int):
-        def hook(_module, _inputs, output):
-            # output is (N, hc_mult, hidden)
-            captured[layer_id] = output.mean(dim=1).detach()  # mean-fold
-
+    def make_hook(lid: int):
+        def hook(_m, _i, output):
+            captured[lid] = output.mean(dim=1).detach()
         return hook
 
-    for layer_id in target_layer_ids:
-        if 0 <= layer_id < len(transformer.layers):
-            h = transformer.layers[layer_id].register_forward_hook(
-                make_hook(layer_id)
-            )
-            handles.append(h)
-        else:
-            raise ValueError(
-                f"target_layer_id {layer_id} out of range "
-                f"[0, {len(transformer.layers)})"
-            )
+    for lid in target_layer_ids:
+        handles.append(transformer.layers[lid].register_forward_hook(make_hook(lid)))
 
-    # --- Run forward ---
     try:
         with torch.no_grad():
-            # The Transformer forward does:
-            #   h = embed → expand hc_mult → layers → head(hc_head + norm) → logits
-            # We need to intercept after layers but before head.
-            # Since head() is called inside forward(), we can't easily hook
-            # the intermediate. So we run the forward manually.
-
             h = transformer.embed(input_ids)
             h = h.unsqueeze(2).repeat(1, 1, transformer.hc_mult, 1)
-
             for layer in transformer.layers:
                 h = layer(h, 0, input_ids)
 
-            # h is now (B, S, hc_mult, hidden) — the output of all layers
-            # Capture the hc_head collapsed output (before norm)
-            # hc_head: hc_head_fn, hc_head_base, hc_head_scale
-            hc_collapsed = transformer.hc_head_fn.float() @ h.float().transpose(-1, -2)
-            hc_collapsed = hc_collapsed.transpose(-1, -2)  # (B, S, 1, hidden)
-            hc_collapsed = hc_collapsed.squeeze(2)  # (B, S, hidden)
-            hc_collapsed = hc_collapsed * transformer.hc_head_scale + transformer.hc_head_base
-
-            last_hidden = hc_collapsed.to(h.dtype)
-
+            # hc_head collapse (before final norm)
+            fn = transformer.hc_head_fn.float()
+            hc = (fn @ h.float().transpose(-1, -2)).transpose(-1, -2)
+            hc = hc.squeeze(2) * transformer.hc_head_scale + transformer.hc_head_base
+            last_hidden = hc.to(h.dtype)
     finally:
         for hdl in handles:
             hdl.remove()
 
-    # --- Concatenate captured mid-layer states ---
     target_hidden = torch.cat(
-        [captured[lid].to(device) for lid in target_layer_ids],
-        dim=-1,
-    )  # (B, S, num_layers * hidden)
-
+        [captured[lid].to(device) for lid in target_layer_ids], dim=-1
+    )
     return ExtractedHiddenStates(
         target_hidden_states=target_hidden.squeeze(0),
         target_last_hidden_states=last_hidden.squeeze(0),
