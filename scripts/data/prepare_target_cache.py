@@ -26,6 +26,8 @@ from deepspec.data.target_cache_dataset import (
 from deepspec.data.jsonl_dataset import JsonLineDataset
 from deepspec.utils import (
     CustomJSONEncoder,
+    device_count,
+    empty_cache,
     get_git_diff,
     get_git_sha,
     init_dist,
@@ -71,23 +73,29 @@ def _resolve_device_map(*, model_type: str, cli_device_map: str | None, device: 
     if cli_device_map == "auto":
         return "auto"
     if cli_device_map == "single":
-        return {"": device}
+        return {"": device} if device.type != "cpu" else None
     if cli_device_map is not None:
         raise ValueError(f"Unsupported --device-map value: {cli_device_map!r}")
 
     # Auto-detect: large / custom-attention models → auto shard.
-    if model_type in ("deepseek_v4",):
+    # But on CPU, skip device_map entirely (no accelerate needed).
+    if model_type in ("deepseek_v4",) and device.type != "cpu":
         return "auto"
+    if device.type == "cpu":
+        return None
     return {"": device}
 
 
-def _load_target_model(*, model_name_or_path: str, dtype: torch.dtype, attn_impl: str, device_map):
+def _load_target_model(*, model_name_or_path: str, dtype: torch.dtype, attn_impl: str, device_map, config=None):
     """Load the target model, placing parameters directly on the target device(s).
 
     When *device_map* is ``"auto"``, ``accelerate`` distributes decoder layers
     across all visible NPUs / GPUs so that a model larger than a single device
     can still run.  When *device_map* is a ``{"": device}`` dict the entire
     model stays on *device* (fast path for small models).
+
+    If *config* is given, it is used instead of the one in *model_name_or_path*
+    (e.g. a cropped config with fewer layers).
     """
     load_kwargs = dict(
         dtype=dtype,
@@ -96,6 +104,8 @@ def _load_target_model(*, model_name_or_path: str, dtype: torch.dtype, attn_impl
     )
     if device_map is not None:
         load_kwargs["device_map"] = device_map
+    if config is not None:
+        load_kwargs["config"] = config
 
     print_on_local_main(
         f"Loading target model from {model_name_or_path!r} "
@@ -252,6 +262,17 @@ def parse_args():
     parser.add_argument("--local-batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument(
+        "--max-layers",
+        type=int,
+        default=None,
+        help=(
+            "Limit the model to the first N decoder layers.  When only a subset "
+            "of weight shards is available locally (e.g. only layers 0-2), set "
+            "this to 3 to avoid MISSING-key errors for layers 3+.  "
+            "target_layer_ids must all be < N."
+        ),
+    )
+    parser.add_argument(
         "--model-config-path",
         default=None,
         help=(
@@ -289,6 +310,7 @@ def _write_manifest(
     hidden_size: int,
     min_loss_tokens: int,
     shards,
+    world_size: int,
 ):
     num_samples = sum(
         int(
@@ -296,7 +318,7 @@ def _write_manifest(
                 os.path.join(output_dir, "_tmp", f"rank_{rank}")
             )["num_local_samples"]
         )
-        for rank in range(dist.get_world_size())
+        for rank in range(world_size)
     )
     manifest = build_target_cache_manifest(
         num_samples=num_samples,
@@ -338,32 +360,54 @@ def main():
     target_layer_ids = [int(layer_id) for layer_id in config.model.target_layer_ids]
     min_loss_tokens = int(cli_args.min_loss_tokens)
     seed_all(int(config.seed))
-    device, global_rank, world_size = init_dist()
+
+    # Single-device: skip HCCL, use local NPU/CUDA/CPU directly.
+    _ndev = device_count()
+    if _ndev <= 1:
+        try:
+            import torch_npu  # noqa: F401
+            if torch.npu.is_available() and torch.npu.device_count() > 0:
+                device = torch.device("npu", 0)
+                torch.npu.set_device(0)
+            else:
+                raise ImportError
+        except ImportError:
+            if torch.cuda.is_available():
+                device = torch.device("cuda", 0)
+                torch.cuda.set_device(0)
+            else:
+                device = torch.device("cpu")
+        global_rank, world_size = 0, 1
+        _distributed = False
+    else:
+        device, global_rank, world_size = init_dist()
+        _distributed = True
+
     output_dir = os.path.abspath(cli_args.output_dir)
-    print_on_local_main(json.dumps(config, indent=4, cls=CustomJSONEncoder), flush=True)
-    print_on_local_main(
-        json.dumps(
-            {
-                "train_data_path": train_data_paths,
-                "output_dir": output_dir,
-                "target_layer_ids": target_layer_ids,
-                "min_loss_tokens": min_loss_tokens,
-                "max_shard_bytes": int(cli_args.max_shard_bytes),
-                "local_batch_size": int(cli_args.local_batch_size),
-                "num_workers": int(cli_args.num_workers),
-            },
-            indent=4,
-        ),
-        flush=True,
-    )
+    print(f"[prepare] device={device} rank={global_rank}/{world_size} "
+          f"distributed={_distributed} ndev={_ndev}")
+    print(json.dumps(
+        {
+            "train_data_path": train_data_paths,
+            "output_dir": output_dir,
+            "target_layer_ids": target_layer_ids,
+            "min_loss_tokens": min_loss_tokens,
+        },
+        indent=4,
+    ), flush=True)
+
     if global_rank == 0:
         prepare_target_cache_output_dir(output_dir)
-    dist.barrier()
+    if _distributed:
+        dist.barrier()
 
     rank_dir = os.path.join(output_dir, "_tmp", f"rank_{global_rank}")
     os.makedirs(rank_dir, exist_ok=True)
 
-    with main_process_first():
+    if _distributed:
+        with main_process_first():
+            dataset = JsonLineDataset(data_paths=train_data_paths)
+    else:
         dataset = JsonLineDataset(data_paths=train_data_paths)
 
     local_start, local_end = compute_local_sample_range(
@@ -392,32 +436,54 @@ def main():
     )
     _model_type = str(_target_cfg.model_type)
 
+    # Crop model layers when only a subset of weights is available.
+    # e.g. --max-layers 3 keeps layers 0,1,2 (6GB instead of 275GB).
+    _max_layer_id = max(target_layer_ids)
+    _num_layers = int(cli_args.max_layers) if cli_args.max_layers else _target_cfg.num_hidden_layers
+    if _num_layers < _target_cfg.num_hidden_layers:
+        assert _max_layer_id < _num_layers, (
+            f"target_layer_ids ({target_layer_ids}) requires at least "
+            f"{_max_layer_id + 1} layers, but --max-layers={_num_layers}"
+        )
+        print_on_local_main(
+            f"Cropping model from {_target_cfg.num_hidden_layers} → {_num_layers} layers"
+        )
+        _target_cfg.num_hidden_layers = _num_layers
+        # Also update layer_types and mlp_layer_types if they exist
+        for attr in ("layer_types", "mlp_layer_types", "compress_ratios"):
+            val = getattr(_target_cfg, attr, None)
+            if isinstance(val, (list, tuple)) and len(val) > _num_layers:
+                setattr(_target_cfg, attr, val[:_num_layers])
+
     # DeepSeek-V4 and other MLA / custom-attention models require eager
     # attention; SDPA does not support their attention patterns.
     _attn = "eager" if _model_type in ("deepseek_v4",) else "sdpa"
 
-    # Resolve device_map strategy and load directly onto NPU / GPU.
-    _device_map = _resolve_device_map(
-        model_type=_model_type,
-        cli_device_map=cli_args.device_map,
-        device=device,
-    )
-    if _device_map == "auto" and world_size > 1:
-        print_on_local_main(
-            "WARNING: device_map='auto' shards one model across all visible "
-            "devices.  Running more than one process per node "
-            f"(current world_size={world_size}) will cause each process to "
-            "compete for the same devices, likely OOMing.  "
-            "Re-launch with --nproc-per-node=1 to use layer-wise sharding, "
-            "or use --device-map single for data-parallel mode."
+    # Load model: deepseek_v4 uses inference/model.py (native FP8 / A8W8),
+    # all other models use AutoModel.from_pretrained (transformers).
+    if _model_type == "deepseek_v4":
+        from deepspec.modeling.deepseek_v4.loader import load_model as _load_dsv4
+
+        # Pass cropped num_hidden_layers to the dsv4 loader.
+        _dsv4_layers = _target_cfg.num_hidden_layers
+        target_model = _load_dsv4(_weight_path, device=device, num_layers=_dsv4_layers)
+        target_hidden_size = target_model.hidden_size
+        _use_dsv4_loader = True
+    else:
+        _device_map = _resolve_device_map(
+            model_type=_model_type,
+            cli_device_map=cli_args.device_map,
+            device=device,
         )
-    target_model = _load_target_model(
-        model_name_or_path=_weight_path,
-        dtype=torch.bfloat16,
-        attn_impl=_attn,
-        device_map=_device_map,
-    )
-    target_hidden_size = _get_target_hidden_size(target_model)
+        target_model = _load_target_model(
+            model_name_or_path=_weight_path,
+            dtype=torch.bfloat16,
+            attn_impl=_attn,
+            device_map=_device_map,
+            config=_target_cfg,
+        )
+        target_hidden_size = _get_target_hidden_size(target_model)
+        _use_dsv4_loader = False
     train_collator = ConversationCollator(
         tokenizer=tokenizer,
         chat_template=config.data.chat_template,
@@ -464,12 +530,21 @@ def main():
                     key: value.to(device, non_blocking=True)
                     for key, value in batch.items()
                 }
-                target_result = run_target_forward_with_hooks(
-                    target_model=target_model,
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    target_layer_ids=target_layer_ids,
-                )
+                if _use_dsv4_loader:
+                    from deepspec.modeling.deepseek_v4.loader import \
+                        extract_hidden_states as _ds_extract
+                    target_result = _ds_extract(
+                        model_loaded=target_model,
+                        input_ids=batch["input_ids"],
+                        target_layer_ids=target_layer_ids,
+                    )
+                else:
+                    target_result = run_target_forward_with_hooks(
+                        target_model=target_model,
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        target_layer_ids=target_layer_ids,
+                    )
                 seq_lens = batch["attention_mask"].sum(dim=1).tolist()
                 for sample_idx_in_batch, seq_len in enumerate(seq_lens):
                     seq_len = int(seq_len)
@@ -497,6 +572,7 @@ def main():
         writer.close()
     del target_model
     _empty_device_cache(device)
+    empty_cache()
     dataset.close()
     summary = LocalCacheWriteSummary(
         global_rank=global_rank,
@@ -507,11 +583,12 @@ def main():
         local_shard_files=list(writer.local_shard_files),
     )
     atomic_json_dump(summary.to_json(), os.path.join(rank_dir, "summary.json"))
-    dist.barrier()
+    if _distributed:
+        dist.barrier()
 
     shard_map = None
     summaries = None
-    if is_global_main_process():
+    if not _distributed or is_global_main_process():
         summaries = [
             load_local_cache_write_summary(
                 os.path.join(output_dir, "_tmp", f"rank_{rank}")
@@ -519,9 +596,10 @@ def main():
             for rank in range(world_size)
         ]
         shard_map, shards = build_global_target_cache_shard_map(summaries)
-    broadcast_payload = [shard_map]
-    dist.broadcast_object_list(broadcast_payload, src=0)
-    shard_map = broadcast_payload[0]
+    if _distributed:
+        broadcast_payload = [shard_map]
+        dist.broadcast_object_list(broadcast_payload, src=0)
+        shard_map = broadcast_payload[0]
     local_summary = load_local_cache_write_summary(rank_dir)
     rename_local_target_cache_shards(
         output_dir=output_dir,
@@ -529,9 +607,10 @@ def main():
         summary=local_summary,
         shard_map=shard_map,
     )
-    dist.barrier()
+    if _distributed:
+        dist.barrier()
 
-    if is_global_main_process():
+    if not _distributed or is_global_main_process():
         assert summaries is not None
         num_valid_samples = finalize_target_cache_index(
             output_dir=output_dir,
@@ -546,14 +625,16 @@ def main():
             hidden_size=target_hidden_size,
             min_loss_tokens=min_loss_tokens,
             shards=shards,
+            world_size=world_size,
         )
         cleanup_target_cache_tmp_dir(output_dir)
-        print_on_global_main(
-            f"Prepared target cache at {output_dir} with "
-            f"{num_valid_samples}/{len(dataset)} valid samples."
+        print(
+            f"[prepare] Done: {num_valid_samples}/{len(dataset)} valid samples "
+            f"→ {output_dir}"
         )
-    dist.barrier()
-    dist.destroy_process_group()
+    if _distributed:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

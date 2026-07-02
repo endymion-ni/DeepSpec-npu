@@ -4,8 +4,22 @@ import numpy as np
 import torch
 
 from .config import CustomJSONEncoder, jsonable, load_config, parse_opts_to_config
+from .device import (
+    accelerator_backend,
+    accelerator_module,
+    current_device_index,
+    device_type,
+    empty_cache,
+    get_rng_state,
+    is_npu_available,
+    make_device,
+    manual_seed_all,
+    set_device,
+    set_rng_state,
+)
 from .distributed import (
     StatelessResumableDistributedSampler,
+    device_count,
     init_dist,
     is_global_main_process,
     is_local_main_process,
@@ -21,7 +35,7 @@ def seed_all(seed):
     torch.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    manual_seed_all(seed)
 
 def get_git_sha(detail_info=False):
     import subprocess
@@ -67,21 +81,33 @@ __all__ = [
     "BF16Optimizer",
     "CustomJSONEncoder",
     "StatelessResumableDistributedSampler",
+    "accelerator_backend",
+    "accelerator_module",
     "add_metric",
+    "current_device_index",
+    "device_count",
+    "device_type",
+    "empty_cache",
     "ensure_dir",
     "flush",
     "get_git_diff",
     "get_git_sha",
+    "get_rng_state",
     "init_dist",
     "is_global_main_process",
     "is_local_main_process",
+    "is_npu_available",
     "jsonable",
     "load_config",
     "main_process_first",
+    "make_device",
+    "manual_seed_all",
     "parse_opts_to_config",
     "print_on_global_main",
     "print_on_local_main",
     "reset",
     "safe_symlink",
     "seed_all",
+    "set_device",
+    "set_rng_state",
 ]

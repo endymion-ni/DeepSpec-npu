@@ -8,6 +8,8 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import Sampler
 
+from .device import current_device_index
+
 
 def _detect_device():
     """Return ``(device_type, backend, local_world_size_fn)`` for the current
@@ -17,9 +19,16 @@ def _detect_device():
     * CUDA (NVIDIA) → ``("cuda", "nccl", torch.cuda.device_count)``
     * CPU (fallback) → ``("cpu", "gloo", lambda: 1)``
     """
+    # Env-var override: DEEPSPEC_DEVICE=cpu|cuda|npu
+    _forced = os.environ.get("DEEPSPEC_DEVICE", "").lower()
+    if _forced == "cpu":
+        return "cpu", "gloo", lambda: 1
+    if _forced == "cuda":
+        return "cuda", "nccl", torch.cuda.device_count
+
     try:
         import torch_npu  # noqa: F401
-        if torch.npu.is_available():
+        if torch.npu.is_available() and torch.npu.device_count() > 0:
             return "npu", "hccl", torch.npu.device_count
     except ImportError:
         pass
@@ -49,6 +58,12 @@ def _current_device_index(device_type: str) -> int:
 
 
 # ---- public API ----
+
+
+def device_count() -> int:
+    """Number of available accelerator devices (NPU / CUDA / CPU)."""
+    _, _, fn = _detect_device()
+    return fn()
 
 
 def init_dist(local_rank=None, timeout_minutes: int = 60):
@@ -107,8 +122,7 @@ def is_local_main_process():
     local_rank = os.environ.get("LOCAL_RANK")
     if local_rank is not None:
         return int(local_rank) == 0
-    _, device_type, _ = _detect_device()
-    return _current_device_index(device_type) == 0
+    return current_device_index() == 0
 
 
 def print_on_global_main(*args, **kwargs):
