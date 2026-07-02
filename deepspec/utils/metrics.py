@@ -27,6 +27,8 @@ def _clone_to_reduce_device(value: torch.Tensor) -> torch.Tensor:
 
 
 def _reduce_dp_value(value: torch.Tensor, op_name: str) -> torch.Tensor:
+    if dist.get_world_size() <= 1:
+        return value
     if op_name == "sum" or op_name == "mean":
         dist.all_reduce(value, op=dist.ReduceOp.SUM)
         if op_name == "mean":
@@ -73,6 +75,8 @@ def _schema():
 
 def _assert_schema_consistent():
     local_schema = _schema()
+    if dist.get_world_size() <= 1:
+        return
     gathered = [None for _ in range(dist.get_world_size())]
     dist.all_gather_object(gathered, local_schema)
     reference = gathered[0]

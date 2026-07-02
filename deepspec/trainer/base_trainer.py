@@ -177,10 +177,17 @@ class BaseTrainer:
                 global_rank=self.global_rank,
             )
         self.model = self.draft_model
-        if self.args.train.torch_compile:
+        if self.args.train.torch_compile and device_type() != "npu":
             print_on_local_main("Compiling training model with torch.compile...")
             self.model = torch.compile(self.model, dynamic=True)
-        self.model = self._wrap_with_fsdp(self.model)
+        elif self.args.train.torch_compile:
+            print_on_local_main(
+                "torch.compile is not yet supported on NPU — skipping compilation."
+            )
+        if self.world_size > 1:
+            self.model = self._wrap_with_fsdp(self.model)
+        else:
+            print_on_local_main("Single-device — skipping FSDP wrap.")
 
         self.train_dataset = CacheDataset(cache_dir=self.args.data.target_cache_path)
         validate_train_cache(
@@ -336,17 +343,20 @@ class BaseTrainer:
                 tensorboard_dir=self.args.logging.tensorboard_dir,
                 exp_name=self.args.exp_name,
             )
-        dist.barrier()
+        if self.world_size > 1:
+            dist.barrier()
         return checkpoint_dir
 
     def _save_and_suspend(self):
         print_on_global_main("Saving checkpoint before suspending...")
         save_checkpoint(**self._checkpoint_kwargs())
-        dist.barrier()
+        if self.world_size > 1:
+            dist.barrier()
         if is_global_main_process():
             print_on_global_main("Going to suspend...")
             self.suspend_controller.go_suspend()
-        dist.barrier()
+        if self.world_size > 1:
+            dist.barrier()
 
     def train(self):
         self.model.train()
@@ -370,7 +380,11 @@ class BaseTrainer:
                 should_sync = (
                     (self.next_micro_step + 1) % self.gradient_accumulation_steps == 0
                 )
-                sync_context = nullcontext() if should_sync else self.model.no_sync()
+                sync_context = (
+                    nullcontext()
+                    if (should_sync or self.world_size <= 1)
+                    else self.model.no_sync()
+                )
                 with sync_context:
                     loss = self.run_batch(batch) / self.gradient_accumulation_steps
                     loss.backward()
@@ -379,9 +393,16 @@ class BaseTrainer:
                 if not should_sync:
                     continue
 
-                grad_norm = FSDP.clip_grad_norm_(
-                    self.model,
-                    float(self.args.train.max_grad_norm),
+                grad_norm = (
+                    FSDP.clip_grad_norm_(
+                        self.model,
+                        float(self.args.train.max_grad_norm),
+                    )
+                    if self.world_size > 1
+                    else torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        float(self.args.train.max_grad_norm),
+                    )
                 )
                 self.optimizer.step()
                 training_logger.on_optimizer_step(
@@ -404,5 +425,6 @@ class BaseTrainer:
 
     def clean_up(self):
         training_logger.close()
-        dist.barrier()
+        if self.world_size > 1:
+            dist.barrier()
         dist.destroy_process_group()

@@ -17,8 +17,9 @@ import copy
 from transformers import AutoConfig
 
 from deepspec.modeling.dspark.common import validate_target_layer_ids
+from deepspec.utils.device import is_npu_available
 
-TRAIN_ATTN_IMPLEMENTATION = "flex_attention"
+TRAIN_ATTN_IMPLEMENTATION = "sdpa" if is_npu_available() else "flex_attention"
 
 # Qwen3-8B shapes used as the dense draft-layer template.
 _QWEN3_8B_DRAFT_BASE = "Qwen/Qwen3-8B"
@@ -91,6 +92,12 @@ def build_draft_config(target_config, model_args):
     draft_config.pad_token_id = target_config.pad_token_id
     draft_config.bos_token_id = target_config.bos_token_id
     draft_config.eos_token_id = target_config.eos_token_id
+
+    # Truncate per-layer lists to match num_draft_layers.
+    for attr in ("layer_types", "mlp_layer_types", "compress_ratios"):
+        val = getattr(draft_config, attr, None)
+        if isinstance(val, (list, tuple)) and len(val) > num_draft_layers:
+            setattr(draft_config, attr, val[:num_draft_layers])
 
     # DSpark-specific fields.
     draft_config.block_size = int(model_args.block_size)

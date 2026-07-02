@@ -160,7 +160,8 @@ def save_checkpoint(
     if is_global_main_process():
         ensure_dir(checkpoint_dir)
         save_train_config(train_config=train_config, checkpoint_dir=checkpoint_dir)
-    dist.barrier()
+    if dist.get_world_size() > 1:
+        dist.barrier()
     _save_model_checkpoint(
         model=model,
         draft_model=draft_model,
@@ -178,14 +179,16 @@ def save_checkpoint(
         training_state,
         _rank_training_state_path(checkpoint_dir, global_rank),
     )
-    dist.barrier()
+    if dist.get_world_size() > 1:
+        dist.barrier()
     if is_global_main_process():
         safe_symlink(
             checkpoint_dir,
             os.path.join(checkpoint_dir_root, "step_latest"),
         )
         print_on_global_main(f"Saved checkpoint to {checkpoint_dir}")
-    dist.barrier()
+    if dist.get_world_size() > 1:
+        dist.barrier()
     return checkpoint_dir
 
 
@@ -224,7 +227,11 @@ def _serialize_training_state(
 
 
 def _full_model_state_dict(model):
-    assert isinstance(model, FSDP), "training model must be wrapped in FSDP"
+    if not isinstance(model, FSDP):
+        # Single-device / no FSDP wrapping.
+        state_dict = model.state_dict()
+        # Move to CPU to match FSDP's offload behaviour.
+        return {k: v.cpu() for k, v in state_dict.items()}
     state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     with FSDP.state_dict_type(
         model,

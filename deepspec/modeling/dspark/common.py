@@ -8,6 +8,14 @@ from torch.nn.attention.flex_attention import create_block_mask
 from deepspec.utils.metrics import add_metric
 
 
+def _arange(*args, device, **kwargs):
+    """``torch.arange`` with int32 dtype on NPU (Ascend doesn't support int64 indexing)."""
+    dtype = kwargs.pop("dtype", None)
+    if dtype is None:
+        dtype = torch.int32 if device.type == "npu" else torch.int64
+    return torch.arange(*args, device=device, dtype=dtype, **kwargs)
+
+
 @dataclass
 class DSparkForwardOutput:
     """Outputs for one DSpark training forward.
@@ -88,8 +96,8 @@ def create_dspark_attention_mask(
         bsz, num_blocks = anchor_positions.shape
         q_len = num_blocks * block_size
         kv_len = seq_len + q_len
-        q_idx = torch.arange(q_len, device=device)
-        kv_idx = torch.arange(kv_len, device=device)
+        q_idx = _arange(q_len, device=device)
+        kv_idx = _arange(kv_len, device=device)
         q_block_ids = (q_idx // block_size).unsqueeze(0).expand(bsz, -1)
         anchor_pos = anchor_positions.gather(1, q_block_ids).unsqueeze(-1)
         q_block_ids = q_block_ids.unsqueeze(-1)
@@ -161,13 +169,14 @@ def sample_anchor_positions(
     valid_counts = valid.sum(dim=1)
     bsz = loss_mask.shape[0]
     num_candidates = valid.shape[1]
+    _idx_dtype = torch.int32 if device.type == "npu" else torch.int64
     max_n = int(num_anchors)
     if num_candidates == 0:
-        anchors = torch.zeros(bsz, max_n, dtype=torch.long, device=device)
+        anchors = torch.zeros(bsz, max_n, dtype=_idx_dtype, device=device)
         keep_mask = torch.zeros(bsz, max_n, dtype=torch.bool, device=device)
         return anchors, keep_mask
 
-    indices = torch.arange(num_candidates, device=device).unsqueeze(0).expand(
+    indices = _arange(num_candidates, device=device).unsqueeze(0).expand(
         bsz,
         -1,
     )
@@ -189,7 +198,7 @@ def sample_anchor_positions(
         )
         gathered = torch.cat([gathered, pad], dim=1)
     anchors = gathered[:, :max_n].sort(dim=1).values
-    keep_mask = torch.arange(max_n, device=device).unsqueeze(0) < (
+    keep_mask = _arange(max_n, device=device).unsqueeze(0) < (
         valid_counts.unsqueeze(1).clamp(max=max_n)
     )
     anchors = torch.where(keep_mask, anchors, torch.zeros_like(anchors))
@@ -281,7 +290,7 @@ def create_position_ids(
 ) -> torch.Tensor:
     bsz, num_blocks = anchor_positions.shape
     device = anchor_positions.device
-    offsets = torch.arange(block_size, device=device).view(1, 1, -1)
+    offsets = _arange(block_size, device=device).view(1, 1, -1)
     return (anchor_positions.unsqueeze(-1) + offsets).view(
         bsz,
         num_blocks * block_size,
@@ -300,16 +309,19 @@ def create_noise_embed(
     bsz = input_ids.shape[0]
     num_blocks = anchor_positions.shape[1]
     device = input_ids.device
+    # NPU IndexPut requires self + values same dtype; indices stay int32
+    # (from _arange).  input_ids may be int32 or int64; cast anchor_tokens
+    # and the fill value to torch.long to keep everything consistent.
     noise_ids = torch.full(
         (bsz, num_blocks * block_size),
         mask_token_id,
         dtype=torch.long,
         device=device,
     )
-    block_starts = torch.arange(num_blocks, device=device) * block_size
+    block_starts = _arange(num_blocks, device=device) * block_size
     block_starts = block_starts.unsqueeze(0).expand(bsz, -1)
-    anchor_tokens = torch.gather(input_ids, 1, anchor_positions)
-    flat_batch_idx = torch.arange(bsz, device=device).unsqueeze(1).expand(
+    anchor_tokens = torch.gather(input_ids, 1, anchor_positions).to(torch.long)
+    flat_batch_idx = _arange(bsz, device=device).unsqueeze(1).expand(
         bsz,
         num_blocks,
     )
