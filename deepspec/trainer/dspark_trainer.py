@@ -162,10 +162,3 @@ class DeepSeekV4DSparkTrainer(Qwen3DSparkTrainer):
             draft_model.lm_head.weight.copy_(weights["lm_head"])
         draft_model.set_embedding_head_trainable(False)
         return draft_model, tokenizer
-
-    def _build_draft_model(self, *, target_config, model_args):
-        draft_config = build_deepseek_v4_draft_config(
-            target_config=target_config,
-            model_args=model_args,
-        )
-        return Qwen3DSparkModel(draft_config)

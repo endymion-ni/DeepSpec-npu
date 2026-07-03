@@ -12,9 +12,9 @@ Training::
 
     bash scripts/train/train.sh  # after setting config_path / target_cache_dir
 
-The draft model uses Qwen3-8B dense shapes (32 heads, 8 kv_heads, head_dim=128,
-intermediate_size=12288, plain rope) for compatibility with DSpark's decoder
-layers, while keeping DeepSeek-V4's vocab_size=129280 and hidden_size=4096.
+The draft model uses DeepSeek-V4 native MLA + MoE + HC layers (64 heads,
+head_dim=512, q_lora_rank=1024, hc_mult=4), cloned from the target model
+with reduced layers (num_draft_layers=5).
 
 Target layer mapping
 --------------------

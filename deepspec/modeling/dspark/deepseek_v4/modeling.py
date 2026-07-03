@@ -22,10 +22,9 @@ from torch import nn
 from typing_extensions import Tuple, Unpack
 
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.models.qwen3.modeling_qwen3 import (
-    FlashAttentionKwargs,
-    rotate_half,
-)
+from transformers.modeling_utils import PreTrainedModel
+from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+from transformers.models.qwen3.modeling_qwen3 import FlashAttentionKwargs
 
 from deepspec.modeling.dspark.common import (
     AcceptRatePredictor,
@@ -40,19 +39,6 @@ from deepspec.utils.sampling import sample_tokens
 
 
 # ---------------------------------------------------------------------------
-# RoPE helpers (same as Qwen3 for training; DeepSeek-V4 uses YaRN at scale)
-# ---------------------------------------------------------------------------
-
-def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_len = q.size(-2)
-    q_embed = (q * cos[..., -q_len:, :]) + (rotate_half(q) * sin[..., -q_len:, :])
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-# ---------------------------------------------------------------------------
 # RoPE — adapted for DeepSeek-V4 (YaRN-compatible, no Qwen3-specific fields)
 # ---------------------------------------------------------------------------
 
@@ -61,13 +47,9 @@ class DeepSeekV4RotaryEmbedding(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.rope_head_dim = getattr(config, "qk_rope_head_dim", self.head_dim)
+        self.rope_head_dim = getattr(config, "qk_rope_head_dim", 64)
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 1048576)
         self.rope_theta = getattr(config, "rope_theta", 10000.0)
-        self._init_freqs()
-
-    def _init_freqs(self):
         dim = self.rope_head_dim
         inv_freq = 1.0 / (
             self.rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
@@ -75,13 +57,31 @@ class DeepSeekV4RotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor, position_ids: torch.LongTensor):
-        inv_freq = self.inv_freq.to(device=x.device, dtype=x.dtype)
-        freqs = torch.outer(position_ids, inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos().unsqueeze(1)  # (bsz, 1, seq_len, rope_dim)
-        sin = emb.sin().unsqueeze(1)
-        return cos, sin
+    def forward(self, position_ids: torch.LongTensor, dtype: torch.dtype, device: torch.device):
+        """Return ``(cos, sin)`` each of shape ``(total_len, rope_head_dim)``."""
+        inv_freq = self.inv_freq.to(device=device, dtype=torch.float32)
+        freqs = torch.outer(position_ids.reshape(-1).float(), inv_freq)  # (total_len, half_dim)
+        emb = torch.cat((freqs, freqs), dim=-1)  # (total_len, rope_head_dim)
+        return emb.cos().to(dtype), emb.sin().to(dtype)
+
+
+def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    """Apply RoPE to *x*, shape ``(*, seq_len, head_dim)``.
+    *cos* / *sin* shape ``(seq_len, rope_dim)``.  The seq_len dim in *x*
+    is the second-to-last non-rope dim (position -2 counting from the
+    right, excluding the rope_dim split)."""
+    rope_dim = cos.shape[-1]
+    x_rope, x_pass = x[..., :rope_dim], x[..., rope_dim:]
+    # Insert singleton dims so cos broadcasts over everything except seq_len.
+    if x.ndim == 4:
+        cos = cos.view(1, -1, 1, rope_dim)
+        sin = sin.view(1, -1, 1, rope_dim)
+    elif x.ndim == 3:
+        cos = cos.view(1, -1, rope_dim)
+        sin = sin.view(1, -1, rope_dim)
+    x1, x2 = x_rope.chunk(2, dim=-1)
+    rotated = torch.cat([-x2, x1], dim=-1)
+    return torch.cat([x_rope * cos + rotated * sin, x_pass], dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +124,8 @@ class DeepSeekV4MLAttention(nn.Module):
         self.o_lora_rank = getattr(config, "o_lora_rank", self.hidden_size)
         self.o_groups = getattr(config, "o_groups", 1)
         self.rope_head_dim = getattr(config, "qk_rope_head_dim", 64)
-        self.qk_nope_head_dim = self.head_dim - self.rope_head_dim
+        self.qk_nope_head_dim = self.head_dim - self.rope_head_dim  # 448
+        self.v_head_dim = self.head_dim  # v uses all non-rope dims
         self.scaling = self.head_dim ** -0.5
         self.eps = getattr(config, "rms_norm_eps", 1e-6)
 
@@ -133,7 +134,9 @@ class DeepSeekV4MLAttention(nn.Module):
         self.q_norm = RMSNorm(self.q_lora_rank, eps=self.eps)
         self.wq_b = nn.Linear(self.q_lora_rank, self.num_heads * self.head_dim, bias=False)
 
-        # KV projection (shared for context + draft)
+        # KV projection: head_dim (nope, shared by k & v) + rope_head_dim (k only).
+        # k = [kv_nope[:qk_nope_head_dim], kv_rope]  → 448 + 64 = 512
+        # v = kv_nope[:head_dim]                       → 512
         self.wkv = nn.Linear(self.hidden_size, self.head_dim + self.rope_head_dim, bias=False)
         self.kv_norm = RMSNorm(self.head_dim + self.rope_head_dim, eps=self.eps)
 
@@ -168,6 +171,22 @@ class DeepSeekV4MLAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # Handle hyper-connection multiplicity: flatten hc_mult into batch dim.
+        _is_hc = hidden_states.ndim == 4  # (bsz, seq, hc_mult, hidden)
+        if _is_hc:
+            bsz, q_len, hc_mult, _ = hidden_states.shape
+            hidden_states = hidden_states.transpose(1, 2).reshape(
+                bsz * hc_mult, q_len, -1,
+            )
+            target_hidden_states = target_hidden_states.unsqueeze(1).expand(
+                -1, hc_mult, -1, -1,
+            ).reshape(bsz * hc_mult, target_hidden_states.shape[1], -1)
+            # Repeat attention mask for HC multiplicity.
+            if attention_mask is not None:
+                attention_mask = attention_mask.repeat_interleave(hc_mult, dim=0)
+        else:
+            hc_mult = 1
+
         bsz, q_len = hidden_states.shape[:-1]
         ctx_len = target_hidden_states.shape[1]
 
@@ -179,27 +198,30 @@ class DeepSeekV4MLAttention(nn.Module):
         kv_noise = self._proj_kv(hidden_states)        # (bsz, q_len,  1, hd+rd)
         kv = torch.cat([kv_ctx, kv_noise], dim=1)      # (bsz, ctx_len+q_len, 1, hd+rd)
 
-        # Split KV into non-RoPE and RoPE parts.
-        k_nope, k_rope = kv[..., : self.qk_nope_head_dim], kv[..., self.qk_nope_head_dim :]
+        # Split KV (MLA convention):
+        #   kv_nope (512) = shared k/v non-RoPE portion
+        #   kv_rope (64)  = k-only RoPE portion
+        #   → k = [kv_nope[:448], kv_rope] = 512  (for attention dot-product)
+        #   → v = kv_nope[:512]            = 512
+        kv_nope = kv[..., : self.head_dim]              # (bsz, kv_len, 1, 512)
+        kv_rope = kv[..., self.head_dim :]               # (bsz, kv_len, 1, 64)
+        k_nope = kv_nope[..., : self.qk_nope_head_dim]   # (bsz, kv_len, 1, 448)
         q_nope, q_rope = q[..., : self.qk_nope_head_dim], q[..., self.qk_nope_head_dim :]
 
-        # Apply RoPE.
+        # Apply RoPE to the rope portions (cos/sin shape: (total_len, rope_dim)).
         cos, sin = position_embeddings
-        q_rope, k_rope = apply_rotary_pos_emb(
-            q_rope.transpose(1, 2), k_rope.transpose(1, 2), cos, sin,
-        )
-        q_rope = q_rope.transpose(1, 2)
-        k_rope = k_rope.transpose(1, 2)
+        q_rope = _apply_rotary(q_rope, cos[ctx_len:], sin[ctx_len:])
+        kv_rope = _apply_rotary(kv_rope, cos, sin)
 
-        q = torch.cat([q_nope, q_rope], dim=-1).transpose(1, 2)  # (bsz, n_heads, q_len, hd)
-        k = torch.cat([k_nope, k_rope], dim=-1)
-        k = k.expand(-1, -1, self.num_heads, -1).transpose(1, 2)  # MQA: 1 KV head → broadcast
-        v = kv[..., : self.head_dim]
-        v = v.expand(-1, -1, self.num_heads, -1).transpose(1, 2)
+        # Assemble Q, K, V for attention.
+        q = torch.cat([q_nope, q_rope], dim=-1).transpose(1, 2)     # (bsz, n_heads, q_len, 512)
+        k = torch.cat([k_nope, kv_rope], dim=-1)                     # (bsz, kv_len, 1, 512)
+        k = k.expand(-1, -1, self.num_heads, -1).transpose(1, 2)    # MQA broadcast
+        v = kv_nope                                                   # (bsz, kv_len, 1, 512)
+        v = v.expand(-1, -1, self.num_heads, -1).transpose(1, 2)    # MQA broadcast
 
         if past_key_values is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+            k, v = past_key_values.update(k, v, self.layer_idx)
 
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             q, k, v,
@@ -215,6 +237,10 @@ class DeepSeekV4MLAttention(nn.Module):
         # Low-rank O projection.
         o = self.wo_a(attn_output)  # (bsz, q_len, o_lora_rank)
         o = self.wo_b(o)            # (bsz, q_len, hidden_size)
+
+        # Un-flatten hyper-connection streams.
+        if _is_hc:
+            o = o.reshape(bsz // hc_mult, hc_mult, q_len, -1).transpose(1, 2)
         return o, None
 
 
@@ -260,15 +286,16 @@ def hc_fuse(
 
     *x*: (bsz, seq_len, hc_mult, hidden_size)
     *fn_weight*: (hc_mult, hc_mult * hidden_size)
-    *scale*: (1,)  output scale
-    *base*: (hc_mult,)  per-stream bias
+    *scale*: (1,) output scale
+    *base*: (hc_mult,) per-stream bias
     """
     hc_mult, hidden = x.shape[2], x.shape[3]
-    bsz, seq_len = x.shape[:2]
-    x_flat = x.reshape(bsz, seq_len, hc_mult * hidden)
-    out = torch.einsum("bsd,md->bsm", x_flat, fn_weight.reshape(hc_mult, hc_mult * hidden))
-    out = out * scale + base.view(1, 1, hc_mult)
-    return out.view(bsz, seq_len, hc_mult, hidden)
+    # W: (hc_mult, hc_mult * hidden) → (hc_mult, hc_mult, hidden)
+    w = fn_weight.view(hc_mult, hc_mult, hidden)
+    # Mix across streams: out[:,:,i,:] = sum_j(x[:,:,j,:] * W[i,j,:])
+    out = torch.einsum("bsjh,ijh->bsih", x, w)
+    out = out * scale + base.view(1, 1, hc_mult, 1)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -358,7 +385,7 @@ class DeepSeekV4DSparkDecoderLayer(nn.Module):
 # DSpark Model
 # ---------------------------------------------------------------------------
 
-class DeepSeekV4DSparkModel(nn.Module):
+class DeepSeekV4DSparkModel(PreTrainedModel):
     """Standalone DSpark draft model for DeepSeek-V4 Flash.
 
     Shares the MLA / MoE / hyper-connection architecture of the target model
@@ -370,10 +397,14 @@ class DeepSeekV4DSparkModel(nn.Module):
     """
 
     _no_split_modules = ["DeepSeekV4DSparkDecoderLayer"]
+    config_class = DeepseekV4Config
+    _supports_sdpa = True
+    _supports_flash_attention_2 = False
+    _supports_flex_attention = False
+    _is_stateful = False
 
     def __init__(self, config):
-        super().__init__()
-        self.config = config
+        super().__init__(config)
 
         # Validate required fields.
         for field in (
@@ -433,6 +464,25 @@ class DeepSeekV4DSparkModel(nn.Module):
             if self.confidence_head_with_markov:
                 input_dim += config.markov_rank
             self.confidence_head = AcceptRatePredictor(input_dim=input_dim)
+
+        self.post_init()
+
+    def save_pretrained(self, save_directory, **kwargs):
+        """Save with original architecture name, stripping quantization_config."""
+        cfg = self.config
+        saved_arch = getattr(cfg, "architectures", None)
+        had_quant = hasattr(cfg, "quantization_config")
+        saved_quant = cfg.quantization_config if had_quant else None
+        try:
+            cfg.architectures = ["DeepseekV4ForCausalLM"]
+            if had_quant:
+                del cfg.quantization_config
+            super().save_pretrained(save_directory, **kwargs)
+        finally:
+            if saved_arch is not None:
+                cfg.architectures = saved_arch
+            if had_quant:
+                cfg.quantization_config = saved_quant
 
     # -- weight init helpers (same interface as Qwen3DSparkModel) ----------
 
@@ -531,7 +581,9 @@ class DeepSeekV4DSparkModel(nn.Module):
     ) -> torch.Tensor:
         hidden_states = noise_embedding
         target_hidden_states = self.hidden_norm(self.fc(target_hidden_states))
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        position_embeddings = self.rotary_emb(
+            position_ids, dtype=hidden_states.dtype, device=hidden_states.device,
+        )
 
         # Expand to hyper-connection multiplicity.
         if self.hc_mult > 1:
@@ -636,7 +688,7 @@ class DeepSeekV4DSparkModel(nn.Module):
         if self.confidence_head is not None:
             # Compute per-position confidence predictions.
             confidence_pred = self.confidence_head(
-                output_hidden_4d.float()
+                output_hidden_4d.to(self.lm_head.weight.dtype)
             ).squeeze(-1)  # (bsz, num_blocks, block_size)
 
         return DSparkForwardOutput(

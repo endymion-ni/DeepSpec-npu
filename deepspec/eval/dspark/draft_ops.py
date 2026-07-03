@@ -7,11 +7,12 @@ from transformers import DynamicCache
 
 from deepspec.eval.base_evaluator import DraftProposal
 from deepspec.utils.sampling import logits_to_probs
+from deepspec.modeling.dspark.deepseek_v4.modeling import DeepSeekV4DSparkModel
 from deepspec.modeling.dspark.gemma4 import Gemma4DSparkModel
 from deepspec.modeling.dspark.qwen3 import Qwen3DSparkModel
 
 
-DSparkModel = Qwen3DSparkModel | Gemma4DSparkModel
+DSparkModel = Qwen3DSparkModel | Gemma4DSparkModel | DeepSeekV4DSparkModel
 
 
 @dataclass

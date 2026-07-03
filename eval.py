@@ -4,11 +4,12 @@ import json
 import os
 import torch
 from transformers import AutoConfig
-from deepspec.eval.dspark import Gemma4DSparkEvaluator, Qwen3DSparkEvaluator
+from deepspec.eval.dspark import DeepSeekV4DSparkEvaluator, Gemma4DSparkEvaluator, Qwen3DSparkEvaluator
 from deepspec.eval.eagle3 import Gemma4Eagle3Evaluator, Qwen3Eagle3Evaluator
 from deepspec.utils import CustomJSONEncoder
 
 EVALUATORS = {
+    "DeepSeekV4DSparkModel": DeepSeekV4DSparkEvaluator,
     "Qwen3DSparkModel": Qwen3DSparkEvaluator,
     "Gemma4DSparkModel": Gemma4DSparkEvaluator,
     "Qwen3Eagle3Model": Qwen3Eagle3Evaluator,
