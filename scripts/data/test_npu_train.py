@@ -20,15 +20,9 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from deepspec.data.target_cache_dataset import CacheDataset
-from deepspec.modeling.dspark.qwen3.modeling import Qwen3DSparkModel
+from deepspec.modeling.dspark.deepseek_v4.modeling import DeepSeekV4DSparkModel
 from deepspec.modeling.dspark.deepseek_v4.config import build_draft_config, TRAIN_ATTN_IMPLEMENTATION
-from deepspec.modeling.dspark.common import (
-    DSparkForwardOutput,
-    create_dspark_attention_mask,
-    create_noise_embed,
-    create_position_ids,
-    sample_anchor_positions,
-)
+from deepspec.modeling.dspark.common import DSparkForwardOutput
 from deepspec.modeling.dspark.loss import compute_dspark_loss
 from deepspec.utils.device import is_npu_available, device_type
 from transformers import AutoConfig, AutoTokenizer
@@ -98,7 +92,7 @@ def main():
           f"vocab_size={draft_config.vocab_size}, "
           f"attn={draft_config._attn_implementation}")
 
-    draft_model = Qwen3DSparkModel(draft_config)
+    draft_model = DeepSeekV4DSparkModel(draft_config)
     draft_model = draft_model.to(device=device, dtype=dtype).train()
 
     # Count params

@@ -4,7 +4,7 @@
 
 ## 环境
 
-- **硬件**: Ascend 910B (64 GB HBM)
+- **硬件**: Ascend 950
 - **软件**: torch_npu, HCCL
 - **训练配置**: `config/dspark/dspark_deepseek_v4_flash.py`
 - **官方模型**: [DeepSeek-V4-Flash-DSpark](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-DSpark)

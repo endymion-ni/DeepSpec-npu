@@ -29,9 +29,11 @@ from transformers.models.qwen3.modeling_qwen3 import FlashAttentionKwargs
 from deepspec.modeling.dspark.common import (
     AcceptRatePredictor,
     DSparkForwardOutput,
+    build_eval_mask,
     create_dspark_attention_mask,
     create_noise_embed,
     create_position_ids,
+    log_sampler_stats,
     sample_anchor_positions,
 )
 from deepspec.modeling.dspark.markov_head import build_markov_head
@@ -681,15 +683,53 @@ class DeepSeekV4DSparkModel(PreTrainedModel):
             )
             aligned_target_logits = self.compute_logits(aligned_target_hidden)
 
+        eval_mask = build_eval_mask(
+            seq_len=seq_len,
+            loss_mask=loss_mask,
+            label_indices=label_indices,
+            safe_label_indices=safe_label_indices,
+            block_keep_mask=block_keep_mask,
+        )
+        anchor_token_ids = torch.gather(
+            input_ids,
+            1,
+            anchor_positions,
+        )
+        prev_token_ids = torch.cat(
+            [anchor_token_ids.unsqueeze(-1), target_ids[:, :, :-1]],
+            dim=-1,
+        )
         draft_logits = self.compute_logits(output_hidden_4d)
-        eval_mask = None  # computed in loss
+        if self.markov_head is not None:
+            draft_logits = self.markov_head.apply_block_logits(
+                draft_logits,
+                token_ids=prev_token_ids,
+                hidden_states=output_hidden_4d,
+            )
+
+        log_sampler_stats(
+            seq_len=seq_len,
+            loss_mask=loss_mask,
+            eval_mask=eval_mask,
+            block_keep_mask=block_keep_mask,
+            block_size=self.block_size,
+            num_anchors=self.num_anchors,
+        )
+
         confidence_pred = None
 
         if self.confidence_head is not None:
-            # Compute per-position confidence predictions.
-            confidence_pred = self.confidence_head(
-                output_hidden_4d.to(self.lm_head.weight.dtype)
-            ).squeeze(-1)  # (bsz, num_blocks, block_size)
+            if self.confidence_head_with_markov:
+                prev_embeddings = self.markov_head.get_prev_embeddings(
+                    prev_token_ids
+                ).to(dtype=output_hidden_4d.dtype)
+                confidence_features = torch.cat(
+                    [output_hidden_4d, prev_embeddings],
+                    dim=-1,
+                )
+                confidence_pred = self.confidence_head(confidence_features).float()
+            else:
+                confidence_pred = self.confidence_head(output_hidden_4d).float()
 
         return DSparkForwardOutput(
             draft_logits=draft_logits,
