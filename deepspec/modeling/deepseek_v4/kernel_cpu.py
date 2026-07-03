@@ -16,8 +16,18 @@ import torch
 import torch.nn.functional as F
 
 # ---------------------------------------------------------------------------
-# Activation quantisation stubs (not called with BF16 weights)
+# Activation quantisation (CPU — pure PyTorch)
 # ---------------------------------------------------------------------------
+
+# FP4 lookup table (matches inference/convert.py)
+_FP4_TABLE = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+     0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    dtype=torch.float32,
+)
+
+_FP8_MAX = 448.0
+
 
 def act_quant(
     x: torch.Tensor,
@@ -26,8 +36,38 @@ def act_quant(
     scale_dtype: torch.dtype = torch.float32,
     inplace: bool = False,
 ):
-    """Stub — BF16 path does not quantise activations."""
-    raise RuntimeError("act_quant should not be called in BF16 inference mode")
+    """Per-block FP8 quantisation (CPU fallback).
+
+    Returns ``(x_fp8, scale)`` where *x_fp8* has dtype ``float8_e4m3fn``
+    and *scale* has dtype *scale_dtype* (or ``float8_e8m0fnu`` when
+    *scale_fmt* is ``"ue8m0"``).
+    """
+    N = x.shape[-1]
+    assert N % block_size == 0, f"last dim {N} not divisible by {block_size}"
+    x_flat = x.reshape(-1, N)
+    M = x_flat.shape[0]
+    nb = N // block_size
+
+    x_blocks = x_flat.view(M, nb, block_size)
+    amax = x_blocks.abs().amax(dim=-1).clamp(min=1e-4)  # (M, nb)
+    scale = amax / _FP8_MAX
+
+    if scale_fmt == "ue8m0":
+        # Round to power-of-2, store as E8M0
+        scale = torch.pow(2.0, torch.ceil(torch.log2(scale.float())))
+        scale_s = scale.to(torch.float8_e8m0fnu)
+    else:
+        scale_s = scale.to(scale_dtype)
+
+    x_q = (x_blocks / scale.unsqueeze(-1)).clamp(-_FP8_MAX, _FP8_MAX)
+    x_q = x_q.to(torch.float8_e4m3fn).view(M, N)
+
+    if inplace:
+        x_dq = (x_q.float() * scale.unsqueeze(-1)).view(M, N).to(x.dtype)
+        x.copy_(x_dq.reshape_as(x))
+        return x
+
+    return x_q.reshape(*x.shape[:-1], N), scale_s
 
 
 def fp4_act_quant(
@@ -35,12 +75,29 @@ def fp4_act_quant(
     block_size: int = 32,
     inplace: bool = False,
 ):
-    """Stub — BF16 path does not quantise activations."""
-    raise RuntimeError("fp4_act_quant should not be called in BF16 inference mode")
+    """Per-block FP4 quantisation (CPU fallback)."""
+    N = x.shape[-1]
+    assert N % block_size == 0
+    x_flat = x.reshape(-1, N)
+    M = x_flat.shape[0]
+    nb = N // block_size
+
+    x_blocks = x_flat.view(M, nb, block_size)
+    amax = x_blocks.abs().amax(dim=-1).clamp(min=6.0 * (2 ** -126))
+    scale = torch.pow(2.0, torch.ceil(torch.log2(amax / 6.0))).to(torch.float8_e8m0fnu)
+    x_q = (x_blocks / scale.unsqueeze(-1)).clamp(-6.0, 6.0)
+    x_q = x_q.to(torch.float4_e2m1fn_x2).view(M, N // 2)
+
+    if inplace:
+        x_dq = (x_q.float() * scale.unsqueeze(-1)).view(M, N).to(x.dtype)
+        x.copy_(x_dq.reshape_as(x))
+        return x
+
+    return x_q.reshape(*x.shape[:-1], N // 2), scale
 
 
 # ---------------------------------------------------------------------------
-# GEMM stubs (not called with BF16 weights)
+# GEMM (CPU — dequantise + torch.matmul)
 # ---------------------------------------------------------------------------
 
 def fp8_gemm(
@@ -49,9 +106,27 @@ def fp8_gemm(
     b: torch.Tensor,
     b_s: torch.Tensor,
     scale_dtype: torch.dtype = torch.float32,
-):
-    """Stub — BF16 path uses F.linear."""
-    raise RuntimeError("fp8_gemm should not be called in BF16 inference mode")
+) -> torch.Tensor:
+    """FP8×FP8 GEMM (CPU fallback): dequantise both → matmul → bf16.
+
+    *a* : (M, K)  float8_e4m3fn
+    *a_s* : (M, ceil(K/128))  scale (float32 or float8_e8m0fnu)
+    *b* : (N, K)  float8_e4m3fn
+    *b_s* : (ceil(N/128), ceil(K/128))  scale
+    """
+    M, K = a.shape
+    N = b.shape[0]
+    bs = 128
+
+    # Dequantise A: (M, K)
+    a_s2 = a_s.float().repeat_interleave(bs, dim=1)[:, :K]
+    a_dq = a.float() * a_s2
+
+    # Dequantise B: (N, K)
+    b_s2 = b_s.float().repeat_interleave(bs, dim=0)[:N].repeat_interleave(bs, dim=1)[:, :K]
+    b_dq = b.float() * b_s2
+
+    return torch.mm(a_dq, b_dq.T).to(torch.get_default_dtype())
 
 
 def fp4_gemm(
@@ -60,9 +135,39 @@ def fp4_gemm(
     b: torch.Tensor,
     b_s: torch.Tensor,
     scale_dtype: torch.dtype = torch.float32,
-):
-    """Stub — BF16 path uses F.linear."""
-    raise RuntimeError("fp4_gemm should not be called in BF16 inference mode")
+) -> torch.Tensor:
+    """FP8×FP4 GEMM (CPU fallback): dequantise both → matmul → bf16.
+
+    *a* : (M, K)  float8_e4m3fn
+    *a_s* : (M, ceil(K/128))  scale
+    *b* : (N, K//2)  float4_e2m1fn_x2  (packed, 2 FP4 per byte)
+    *b_s* : (N, ceil(K/32))  scale (float8_e8m0fnu)
+    """
+    M, K = a.shape
+    N = b.shape[0]
+    K_logical = b.shape[1] * 2  # unpacked
+
+    # Dequantise A
+    a_s2 = a_s.float().repeat_interleave(128, dim=1)[:, :K]
+    a_dq = a.float() * a_s2
+
+    # Unpack FP4: each uint8 → two 4-bit values → lookup table
+    w_u8 = b.view(torch.uint8)
+    low = w_u8 & 0x0F
+    high = (w_u8 >> 4) & 0x0F
+    tbl = _FP4_TABLE.to(device=b.device)
+    b_dq = torch.stack([tbl[low.long()], tbl[high.long()]], dim=-1)
+    b_dq = b_dq.reshape(N, K_logical).float()
+
+    # Dequantise B: (N, K_logical)
+    b_s2 = b_s.float().repeat_interleave(32, dim=1)[:, :K_logical]
+    b_dq = b_dq * b_s2
+
+    # Truncate to match K if K_logical > K
+    if K_logical > K:
+        b_dq = b_dq[:, :K]
+
+    return torch.mm(a_dq, b_dq.T).to(torch.get_default_dtype())
 
 
 # ---------------------------------------------------------------------------

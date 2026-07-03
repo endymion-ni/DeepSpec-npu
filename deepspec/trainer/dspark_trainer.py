@@ -101,18 +101,25 @@ class Gemma4DSparkTrainer(Qwen3DSparkTrainer):
 
 
 class DeepSeekV4DSparkTrainer(Qwen3DSparkTrainer):
-    """DSpark trainer for DeepSeek-V4 Flash as target model.
+    """DSpark trainer for DeepSeek-V4 Flash — native MLA + MoE + HC draft.
 
-    The draft model uses Qwen3-8B shapes for dense transformer compatibility
-    while keeping DeepSeek-V4's vocab_size (129280) and hidden_size (4096).
-    The embed_tokens and lm_head are copied from the DeepSeek-V4 target model.
+    Uses :class:`~deepspec.modeling.dspark.deepseek_v4.modeling.DeepSeekV4DSparkModel`
+    cloned from the target model architecture with reduced layers.  Only
+    ``embed_tokens`` and ``lm_head`` weights are loaded from the target
+    model (via safetensors shards, not the full 275 GB checkpoint).
 
-    Unlike the base trainer, this class does **not** load the full ~275 GB
-    target model.  Instead it reads only ``embed.weight`` and ``head.weight``
-    directly from the safetensors shards via :func:`_load_target_weights_from_safetensors`.
-    The weight directory defaults to the ``DEEPSPEC_DSV4_WEIGHT_DIR``
-    environment variable, falling back to ``/workspace/deepseek-v4-flash``.
+    Weight directory: ``DEEPSPEC_DSV4_WEIGHT_DIR`` env var or
+    ``/workspace/deepseek-v4-flash``.
     """
+
+    def _build_draft_model(self, *, target_config, model_args):
+        from deepspec.modeling.dspark.deepseek_v4.modeling import DeepSeekV4DSparkModel
+
+        draft_config = build_deepseek_v4_draft_config(
+            target_config=target_config,
+            model_args=model_args,
+        )
+        return DeepSeekV4DSparkModel(draft_config)
 
     def build_models(self):
         model_args = self.args.model
