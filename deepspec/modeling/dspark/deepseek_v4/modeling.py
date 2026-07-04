@@ -101,18 +101,21 @@ class RMSNorm(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Shared-KV / MQA attention for DeepSeek-V4 Flash DSpark
+# DSpark attention — matches official ``DSparkAttention`` in cann-recipes
 # ---------------------------------------------------------------------------
 
-class DeepSeekV4SharedKVAttention(nn.Module):
-    """Training-friendly counterpart of the official DSpark ``DSparkAttention``.
+class DSparkAttention(nn.Module):
+    """Training-friendly counterpart of the official ``DSparkAttention``.
 
-    Differences from the inference-only CUDA path:
+    Matches ``cann-recipes-infer_dspark/models/deepseek-v4/models/dspark_modeling.py``:
 
-    * Uses standard ``F.scaled_dot_product_attention`` instead of NPU sparse
-      attention/cache kernels.
-    * Operates in bf16 (no FP8 quantisation during training).
-    * Supports both context and draft positions in a single forward call.
+    * ``_project_dspark_q`` / ``_project_dspark_kv`` — low-rank MLA projections
+      with RoPE applied inside (QK-normalisation, kv-norm).
+    * ``attn_sink`` — learnable attention-sink bias (official uses it in
+      sparse-attn weighted softmax).
+    * Shared-KV/MQA: 1 KV head broadcast to ``num_heads``.
+    * Dense ``F.scaled_dot_product_attention`` instead of NPU sparse-attn
+      kernels (no FP8 quantisation during training).
     """
 
     def __init__(self, config, layer_idx: int):
@@ -127,7 +130,6 @@ class DeepSeekV4SharedKVAttention(nn.Module):
         self.o_groups = getattr(config, "o_groups", 1)
         self.rope_head_dim = getattr(config, "qk_rope_head_dim", 64)
         self.qk_nope_head_dim = self.head_dim - self.rope_head_dim  # 448
-        self.v_head_dim = self.head_dim  # v uses all non-rope dims
         self.scaling = self.head_dim ** -0.5
         self.eps = getattr(config, "rms_norm_eps", 1e-6)
 
@@ -136,32 +138,49 @@ class DeepSeekV4SharedKVAttention(nn.Module):
         self.q_norm = RMSNorm(self.q_lora_rank, eps=self.eps)
         self.wq_b = nn.Linear(self.q_lora_rank, self.num_heads * self.head_dim, bias=False)
 
-        # KV projection: head_dim (nope, shared by k & v) + rope_head_dim (k only).
-        # k = [kv_nope[:qk_nope_head_dim], kv_rope]  → 448 + 64 = 512
-        # v = kv_nope[:head_dim]                       → 512
+        # KV projection: head_dim (nope, shared) + rope_head_dim (k-only).
         self.wkv = nn.Linear(self.hidden_size, self.head_dim + self.rope_head_dim, bias=False)
         self.kv_norm = RMSNorm(self.head_dim + self.rope_head_dim, eps=self.eps)
 
-        # Low-rank O projection: wo_a → wo_b
+        # Low-rank O projection: wo_a (grouped) → wo_b
         self.wo_a = nn.Linear(
-            self.num_heads * self.head_dim, self.o_lora_rank, bias=False
+            self.num_heads * self.head_dim, self.o_lora_rank, bias=False,
         )
         self.wo_b = nn.Linear(self.o_lora_rank, self.hidden_size, bias=False)
 
-    def _proj_q(self, x: torch.Tensor) -> torch.Tensor:
-        """Low-rank Q with QK-normalisation (like the official code)."""
+        # attn_sink — official ``attn_sink`` for sparse-attn weighted softmax.
+        self.attn_sink = nn.Parameter(torch.zeros(self.num_heads))
+
+    # ------------------------------------------------------------------
+    # MLA projection helpers  (match _project_dspark_q / _project_dspark_kv)
+    # ------------------------------------------------------------------
+
+    def _project_dspark_q(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+        """Low-rank Q with QK-normalisation + RoPE — matches official."""
         q = self.wq_a(x)
-        q = self.q_norm(q)
+        q = self.q_norm(q)           # no FP8 quant during training
         q = self.wq_b(q)
         q = q.unflatten(-1, (self.num_heads, self.head_dim))
-        # QK normalisation (rl * rsq)
         q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
-        return q
+        # Split nope / rope, apply RoPE to rope portion.
+        q_nope, q_rope = q[..., : self.qk_nope_head_dim], q[..., self.qk_nope_head_dim :]
+        q_rope = _apply_rotary(q_rope, cos, sin)
+        return torch.cat([q_nope, q_rope], dim=-1)
 
-    def _proj_kv(self, x: torch.Tensor) -> torch.Tensor:
+    def _project_dspark_kv(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+        """KV projection with kv-norm + RoPE — matches official."""
         kv = self.wkv(x)
-        kv = self.kv_norm(kv)
-        return kv.unflatten(-1, (1, self.head_dim + self.rope_head_dim))
+        kv = self.kv_norm(kv)        # no FP8 quant during training
+        kv = kv.unflatten(-1, (1, self.head_dim + self.rope_head_dim))
+        # Split: kv_nope(512) shared, kv_rope(64) k-only.
+        kv_nope = kv[..., : self.head_dim]
+        kv_rope = kv[..., self.head_dim :]
+        kv_rope = _apply_rotary(kv_rope, cos, sin)
+        return kv_nope, kv_rope
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
 
     def forward(
         self,
@@ -173,17 +192,16 @@ class DeepSeekV4SharedKVAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        # Handle hyper-connection multiplicity: flatten hc_mult into batch dim.
-        _is_hc = hidden_states.ndim == 4  # (bsz, seq, hc_mult, hidden)
+        # Flatten HC multiplicity into batch dim.
+        _is_hc = hidden_states.ndim == 4
         if _is_hc:
-            bsz, q_len, hc_mult, _ = hidden_states.shape
+            _bsz, q_len, hc_mult, _ = hidden_states.shape
             hidden_states = hidden_states.transpose(1, 2).reshape(
-                bsz * hc_mult, q_len, -1,
+                _bsz * hc_mult, q_len, -1,
             )
             target_hidden_states = target_hidden_states.unsqueeze(1).expand(
                 -1, hc_mult, -1, -1,
-            ).reshape(bsz * hc_mult, target_hidden_states.shape[1], -1)
-            # Repeat attention mask for HC multiplicity.
+            ).reshape(_bsz * hc_mult, target_hidden_states.shape[1], -1)
             if attention_mask is not None:
                 attention_mask = attention_mask.repeat_interleave(hc_mult, dim=0)
         else:
@@ -191,40 +209,37 @@ class DeepSeekV4SharedKVAttention(nn.Module):
 
         bsz, q_len = hidden_states.shape[:-1]
         ctx_len = target_hidden_states.shape[1]
+        kv_len = ctx_len + q_len
 
-        # Q from draft hidden states (low-rank DSpark path).
-        q = self._proj_q(hidden_states)  # (bsz, q_len, n_heads, head_dim)
+        cos, sin = position_embeddings  # each: (total_len, rope_dim)
 
-        # K / V from target context + draft hidden states (concatenated).
-        kv_ctx = self._proj_kv(target_hidden_states)  # (bsz, ctx_len, 1, hd+rd)
-        kv_noise = self._proj_kv(hidden_states)        # (bsz, q_len,  1, hd+rd)
-        kv = torch.cat([kv_ctx, kv_noise], dim=1)      # (bsz, ctx_len+q_len, 1, hd+rd)
+        # Q from draft hidden states.
+        q = self._project_dspark_q(hidden_states, cos[kv_len - q_len:], sin[kv_len - q_len:])
 
-        # Split shared KV:
-        #   kv_nope (512) = shared k/v non-RoPE portion
-        #   kv_rope (64)  = k-only RoPE portion
-        #   → k = [kv_nope[:448], kv_rope] = 512  (for attention dot-product)
-        #   → v = kv_nope[:512]            = 512
-        kv_nope = kv[..., : self.head_dim]              # (bsz, kv_len, 1, 512)
-        kv_rope = kv[..., self.head_dim :]               # (bsz, kv_len, 1, 64)
-        k_nope = kv_nope[..., : self.qk_nope_head_dim]   # (bsz, kv_len, 1, 448)
-        q_nope, q_rope = q[..., : self.qk_nope_head_dim], q[..., self.qk_nope_head_dim :]
+        # KV from target context + draft hidden states.
+        kv_ctx_nope, kv_ctx_rope = self._project_dspark_kv(
+            target_hidden_states, cos[:ctx_len], sin[:ctx_len],
+        )
+        kv_draft_nope, kv_draft_rope = self._project_dspark_kv(
+            hidden_states, cos[ctx_len:], sin[ctx_len:],
+        )
+        kv_nope = torch.cat([kv_ctx_nope, kv_draft_nope], dim=1)
+        kv_rope = torch.cat([kv_ctx_rope, kv_draft_rope], dim=1)
 
-        # Apply RoPE to the rope portions (cos/sin shape: (total_len, rope_dim)).
-        cos, sin = position_embeddings
-        q_rope = _apply_rotary(q_rope, cos[ctx_len:], sin[ctx_len:])
-        kv_rope = _apply_rotary(kv_rope, cos, sin)
+        # Assemble K, V for MQA.
+        k_nope = kv_nope[..., : self.qk_nope_head_dim]
+        k = torch.cat([k_nope, kv_rope], dim=-1)
+        v = kv_nope
 
-        # Assemble Q, K, V for attention.
-        q = torch.cat([q_nope, q_rope], dim=-1).transpose(1, 2)     # (bsz, n_heads, q_len, 512)
-        k = torch.cat([k_nope, kv_rope], dim=-1)                     # (bsz, kv_len, 1, 512)
-        k = k.expand(-1, -1, self.num_heads, -1).transpose(1, 2)    # MQA broadcast
-        v = kv_nope                                                   # (bsz, kv_len, 1, 512)
-        v = v.expand(-1, -1, self.num_heads, -1).transpose(1, 2)    # MQA broadcast
+        # MQA broadcast: (bsz, kv_len, 1, dim) → (bsz, n_heads, kv_len, dim)
+        q = q.transpose(1, 2)
+        k = k.expand(-1, -1, self.num_heads, -1).transpose(1, 2)
+        v = v.expand(-1, -1, self.num_heads, -1).transpose(1, 2)
 
         if past_key_values is not None:
             k, v = past_key_values.update(k, v, self.layer_idx)
 
+        # Dense attention (training fallback; NPU sparse-attn kernel in production).
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attention_mask,
@@ -233,16 +248,15 @@ class DeepSeekV4SharedKVAttention(nn.Module):
             scale=self.scaling,
         )
         attn_output = attn_output.transpose(1, 2).contiguous().view(
-            bsz, q_len, self.num_heads * self.head_dim
+            bsz, q_len, self.num_heads * self.head_dim,
         )
 
         # Low-rank O projection.
-        o = self.wo_a(attn_output)  # (bsz, q_len, o_lora_rank)
-        o = self.wo_b(o)            # (bsz, q_len, hidden_size)
+        o = self.wo_a(attn_output)
+        o = self.wo_b(o)
 
-        # Un-flatten hyper-connection streams.
         if _is_hc:
-            o = o.reshape(bsz // hc_mult, hc_mult, q_len, -1).transpose(1, 2)
+            o = o.reshape(_bsz, hc_mult, q_len, -1).transpose(1, 2)
         return o, None
 
 
@@ -420,7 +434,7 @@ class DeepSeekV4DSparkDecoderLayer(nn.Module):
         mix_hc = (2 + self.hc_mult) * self.hc_mult
         hc_dim = self.hc_mult * config.hidden_size
 
-        self.attn = DeepSeekV4SharedKVAttention(config, layer_idx=layer_idx)
+        self.attn = DSparkAttention(config, layer_idx=layer_idx)
         self.mlp = DeepSeekV4MLP(config)
 
         self.attn_norm = RMSNorm(config.hidden_size, eps=self.norm_eps)
@@ -872,11 +886,10 @@ class DeepSeekV4DSparkModel(PreTrainedModel):
 
 
 __all__ = [
+    "DSparkAttention",
     "DeepSeekV4DSparkModel",
     "DeepSeekV4DSparkDecoderLayer",
-    "DeepSeekV4SharedKVAttention",
     "DeepSeekV4MLAttention",
 ]
 
-
-DeepSeekV4MLAttention = DeepSeekV4SharedKVAttention
+DeepSeekV4MLAttention = DSparkAttention
