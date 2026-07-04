@@ -12,17 +12,16 @@ Training::
 
     bash scripts/train/train.sh  # after setting config_path / target_cache_dir
 
-The draft model uses DeepSeek-V4 native MLA + MoE + HC layers (64 heads,
-head_dim=512, q_lora_rank=1024, hc_mult=4), cloned from the target model
-with reduced layers (num_draft_layers=5).
+The draft model follows the Ascend DSpark inference recipe for
+DeepSeek-V4-Flash-DSpark: block size 5, 3 draft stages, Shared-KV/MQA
+attention (num_key_value_heads=1), q_lora_rank=1024, and hc_mult=4.
 
 Target layer mapping
 --------------------
-Following the reference DFlash-Ascend-experiments extraction pipeline,
-``target_layer_ids = [2, 21, 40]`` captures three mid-layers whose outputs
-(after mean-folding the 4 hyper-connection residual streams) form the
-cross-attention context.  The model's final ``last_hidden_state`` serves as
-the verifier target for L1 loss and confidence head supervision.
+Following the Ascend DSpark PR, ``target_layer_ids = [40, 41, 42]`` captures
+the final three target hidden states used by ``mtp.0.main_proj`` on the
+inference side.  The model's final ``last_hidden_state`` serves as the
+verifier target for L1 loss and confidence head supervision.
 """
 
 import os
@@ -33,7 +32,7 @@ BASE_TB_DIR = os.path.expanduser("~/tensorboard")
 BASE_CKPT_DIR = os.path.expanduser("~/checkpoints")
 
 project_name = "deepspec"
-exp_name = "dspark_block7_deepseek_v4_flash"
+exp_name = "dspark_block5_deepseek_v4_flash"
 seed = 42
 
 model = dict(
@@ -41,20 +40,19 @@ model = dict(
     target_model_name_or_path="deepseek-ai/DeepSeek-V4-Flash",
 
     # ---- DSpark block drafting ----
-    block_size=7,
-    num_draft_layers=5,
+    block_size=5,
+    num_draft_layers=3,
 
     # ---- Target layers captured into the cache ----
-    # Layers 2, 21, 40 are mid-decoder layers whose hyper-connection outputs
-    # (4 residual streams) are mean-folded into a single (seq, 4096) vector.
+    # Layers 40, 41, 42 match dspark_target_layer_ids in the Ascend recipe and
+    # feed the training equivalent of mtp.0.main_proj.
     # The last_hidden_state (layer 43 hc_head + norm output) serves as the
     # verifier target for L1 loss and confidence head.
-    target_layer_ids=[2, 21, 40],
+    target_layer_ids=[40, 41, 42],
 
-    # ---- Mask token for noise embedding ----
-    # DeepSeek V4 vocab: 0-127999 regular, 128000-129279 special.
-    # 128000 = <｜place▁holder▁no▁0｜> is an unused special token, suitable as mask.
-    mask_token_id=128000,
+    # ---- Noise token for DSpark input embedding ----
+    # Matches dspark_noise_token_id in the Ascend recipe.
+    mask_token_id=128799,
     num_anchors=512,
 
     # ---- Markov head ----

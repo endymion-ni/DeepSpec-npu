@@ -15,7 +15,7 @@
 
 ```
 train.py → DeepSeekV4DSparkTrainer
-  ├── config: DeepSeek-V4 原生 MLA + MoE + HC (单层 ~1.28B params)
+  ├── config: DeepSeek-V4 Flash DSpark Shared-KV/MQA + MoE + HC
   ├── 权重: 仅加载 embed.weight + head.weight (2 个 safetensors shard, ~2GB)
   ├── 数据: target cache (precomputed hidden states)
   └── 单卡: 跳过 FSDP, torch.compile, 所有 dist.barrier
@@ -29,7 +29,7 @@ train.py → DeepSeekV4DSparkTrainer
 |------|---------------------|------------------------|
 | 模型类 | `Qwen3DSparkModel` | `DeepSeekV4DSparkModel` |
 | 配置构建 | `build_draft_config` (Qwen3 base) | `build_draft_config` (clone target config) |
-| Attention | Dense MHA: 32 heads, 8 KV, head_dim=128 | **MLA**: 64 heads, 1 KV(MQA), head_dim=512, q_lora_rank=1024, o_lora_rank=1024 |
+| Attention | Dense MHA: 32 heads, 8 KV, head_dim=128 | **Shared-KV/MQA**: 64 heads, 1 KV, head_dim=512, q_lora_rank=1024, o_lora_rank=1024 |
 | FFN | Dense SwiGLU (intermediate=12288) | Dense SwiGLU (intermediate=2048, 训练期替 MoE) |
 | Position | Qwen3 RoPE (`rope_parameters`) | 自建 RoPE (无 Qwen3 依赖) |
 | Residual | Standard residual | **Hyper-Connection** (hc_mult=4) |
@@ -109,8 +109,8 @@ draft_model.set_embedding_head_trainable(False)
 
 | 文件 | 说明 |
 |------|------|
-| `modeling.py` | `DeepSeekV4DSparkModel` — MLA + HC + 自建 RoPE，继承 `PreTrainedModel`，支持 `save_pretrained` / `from_pretrained` |
-| `config.py` | `build_draft_config` — 直接从 target config clone，只改层数和 DSpark 字段，保留全部 MLA/MoE/HC 原生维度 |
+| `modeling.py` | `DeepSeekV4DSparkModel` — Shared-KV/MQA + HC + 自建 RoPE，继承 `PreTrainedModel`，支持 `save_pretrained` / `from_pretrained` |
+| `config.py` | `build_draft_config` — 直接从 target config clone，只改层数和 DSpark 字段，保留全部 Shared-KV/MQA/MoE/HC 原生维度 |
 
 ### 推理 eval (`deepspec/eval/`)
 
@@ -175,7 +175,7 @@ bash scripts/train/train_single.sh
 | 文件 | 改动 |
 |------|------|
 | `deepspec/modeling/dspark/deepseek_v4/config.py` | flex_attention → sdpa (NPU)；`build_draft_config` 改为 clone target config；截断 per-layer 列表 |
-| `deepspec/modeling/dspark/deepseek_v4/modeling.py` | **新建** — `DeepSeekV4DSparkModel` (MLA + HC + DeepSeekV4RotaryEmbedding) |
+| `deepspec/modeling/dspark/deepseek_v4/modeling.py` | **新建** — `DeepSeekV4DSparkModel` (Shared-KV/MQA + HC + DeepSeekV4RotaryEmbedding) |
 | `deepspec/modeling/dspark/common.py` | `_arange()` int32 索引；`create_noise_embed` IndexPut dtype 修复；`sample_anchor_positions` int32 anchors |
 | `deepspec/trainer/base_trainer.py` | torch.compile NPU 跳过；单卡 FSDP 跳过；单卡 dist.barrier 保护；grad_norm 无 FSDP fallback |
 | `deepspec/trainer/dspark_trainer.py` | `DeepSeekV4DSparkTrainer.build_models()` 直接读 safetensors 权重；使用 `DeepSeekV4DSparkModel` |

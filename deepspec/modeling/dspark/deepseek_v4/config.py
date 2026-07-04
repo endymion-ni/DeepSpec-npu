@@ -1,13 +1,12 @@
 """Draft config builder for DeepSeek-V4 Flash as target model.
 
-Builds a config that keeps DeepSeek-V4's native MLA / MoE / HC shapes:
+Builds a config that keeps DeepSeek-V4 Flash's native DSpark shapes:
 
     head_dim=512, num_attention_heads=64, num_key_value_heads=1 (MQA),
     q_lora_rank=1024, o_lora_rank=1024, o_groups=8,
     qk_rope_head_dim=64, moe_intermediate_size=2048, hc_mult=4.
 
-Only the layer count is reduced to ``num_draft_layers`` (default 1, matching
-the official ``mtp.0`` design).  Compatible with
+Only the layer count is reduced to ``num_draft_layers``.  Compatible with
 :class:`~deepspec.modeling.dspark.deepseek_v4.modeling.DeepSeekV4DSparkModel`.
 """
 
@@ -57,6 +56,12 @@ def _add_dspark_fields(draft_config, model_args, target_layer_ids, enable_confid
     if markov_rank > 0:
         draft_config.markov_head_type = str(model_args.markov_head_type)
 
+    # Official Ascend DSpark config aliases.
+    draft_config.dspark_block_size = draft_config.block_size
+    draft_config.dspark_noise_token_id = draft_config.mask_token_id
+    draft_config.dspark_target_layer_ids = list(target_layer_ids)
+    draft_config.dspark_markov_rank = markov_rank
+
 
 def _truncate_per_layer_lists(draft_config, num_layers):
     for attr in ("layer_types", "mlp_layer_types"):
@@ -71,7 +76,7 @@ def _truncate_per_layer_lists(draft_config, num_layers):
 def build_draft_config(target_config, model_args):
     """Build a DeepSeek-V4 native DSpark draft config.
 
-    Clones the target model's architecture (MLA, MoE, HC) and reduces the
+    Clones the target model's architecture (Shared-KV/MQA, MoE, HC) and reduces the
     layer count to ``num_draft_layers``.  Compatible with
     :class:`~deepspec.modeling.dspark.deepseek_v4.modeling.DeepSeekV4DSparkModel`.
     """
@@ -82,6 +87,7 @@ def build_draft_config(target_config, model_args):
     draft_config.architectures = ["DeepSeekV4DSparkModel"]
     draft_config.num_target_layers = int(target_config.num_hidden_layers)
     draft_config.num_hidden_layers = num_draft_layers
+    draft_config.dspark_num_layers = num_draft_layers
     draft_config.tie_word_embeddings = False
     draft_config._attn_implementation = TRAIN_ATTN_IMPLEMENTATION
 

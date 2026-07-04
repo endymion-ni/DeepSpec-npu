@@ -72,10 +72,10 @@ def main():
     # Mimic model_args from config/dspark/dspark_deepseek_v4_flash.py
     from deepspec.utils.config import ConfigNode
     model_args = ConfigNode(
-        block_size=7,
-        num_draft_layers=5,
-        target_layer_ids=[2, 21, 40],
-        mask_token_id=128000,
+        block_size=5,
+        num_draft_layers=3,
+        target_layer_ids=[40, 41, 42],
+        mask_token_id=128799,
         num_anchors=512,
         markov_rank=256,
         markov_head_type="vanilla",

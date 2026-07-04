@@ -2,15 +2,15 @@
 
 Reference: `DeepSeek-V4-Flash-DSpark <https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-DSpark>`_
 
-The official model embeds the DSpark speculative decoder as an ``mtp.0`` layer
-inside the full 43-layer DeepSeek-V4 backbone.  That approach shares the
-MLA + MoE + hyper-connection architecture of the target model, but requires
-the full ~275 GB checkpoint.
+The official Ascend inference model embeds the DSpark speculative decoder as
+``mtp.*`` stages inside the full 43-layer DeepSeek-V4 backbone.  That path uses
+Shared-KV/MQA attention, MoE and hyper-connections, but requires the full
+checkpoint and NPU custom kernels.
 
-This module provides a **standalone** draft model that shares the same layer
-design (MLA attention, optional MoE, hyper-connections) while keeping only a
-small number of draft layers (``num_draft_layers``, default 1).  It exposes
-the same ``forward()`` / ``_forward_backbone()`` interface as
+This module provides a **standalone** draft model that keeps the same DSpark
+training contract while using PyTorch/SDPA-friendly approximations for the
+kernel-heavy pieces.  It exposes the same ``forward()`` / ``_forward_backbone()``
+interface as
 :class:`~deepspec.modeling.dspark.qwen3.modeling.Qwen3DSparkModel` so it is
 a drop-in replacement in the training pipeline.
 """
@@ -101,16 +101,16 @@ class RMSNorm(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# MLA (Multi-head Latent Attention) — DeepSeek-V4 native attention
+# Shared-KV / MQA attention for DeepSeek-V4 Flash DSpark
 # ---------------------------------------------------------------------------
 
-class DeepSeekV4MLAttention(nn.Module):
-    """MLA layer matching the official DeepSeek-V4 DSpark ``DSparkAttention``.
+class DeepSeekV4SharedKVAttention(nn.Module):
+    """Training-friendly counterpart of the official DSpark ``DSparkAttention``.
 
     Differences from the inference-only CUDA path:
 
-    * Uses standard ``F.scaled_dot_product_attention`` instead of
-      ``sparse_attn`` (tilelang kernel).
+    * Uses standard ``F.scaled_dot_product_attention`` instead of NPU sparse
+      attention/cache kernels.
     * Operates in bf16 (no FP8 quantisation during training).
     * Supports both context and draft positions in a single forward call.
     """
@@ -192,7 +192,7 @@ class DeepSeekV4MLAttention(nn.Module):
         bsz, q_len = hidden_states.shape[:-1]
         ctx_len = target_hidden_states.shape[1]
 
-        # Q from draft hidden states (low-rank MLA path).
+        # Q from draft hidden states (low-rank DSpark path).
         q = self._proj_q(hidden_states)  # (bsz, q_len, n_heads, head_dim)
 
         # K / V from target context + draft hidden states (concatenated).
@@ -200,7 +200,7 @@ class DeepSeekV4MLAttention(nn.Module):
         kv_noise = self._proj_kv(hidden_states)        # (bsz, q_len,  1, hd+rd)
         kv = torch.cat([kv_ctx, kv_noise], dim=1)      # (bsz, ctx_len+q_len, 1, hd+rd)
 
-        # Split KV (MLA convention):
+        # Split shared KV:
         #   kv_nope (512) = shared k/v non-RoPE portion
         #   kv_rope (64)  = k-only RoPE portion
         #   → k = [kv_nope[:448], kv_rope] = 512  (for attention dot-product)
@@ -300,6 +300,13 @@ def hc_fuse(
     return out
 
 
+def init_hc_parameters(fn_weight: torch.Tensor, base: torch.Tensor, scale: torch.Tensor):
+    """Initialize custom HC parameters that ``post_init`` does not see."""
+    nn.init.normal_(fn_weight, mean=0.0, std=0.02)
+    nn.init.zeros_(base)
+    nn.init.ones_(scale)
+
+
 # ---------------------------------------------------------------------------
 # Decoder Layer
 # ---------------------------------------------------------------------------
@@ -307,7 +314,7 @@ def hc_fuse(
 class DeepSeekV4DSparkDecoderLayer(nn.Module):
     """A single decoder layer for the DSpark draft model.
 
-    Architecture: Pre-norm with MLA attention + SwiGLU MLP + hyper-connection
+    Architecture: Pre-norm with Shared-KV/MQA attention + SwiGLU MLP + hyper-connection
     mixing.  Target hidden states are projected through the same attention K/V
     path (shared weights for context and draft positions).
     """
@@ -318,7 +325,7 @@ class DeepSeekV4DSparkDecoderLayer(nn.Module):
         self.hc_mult = getattr(config, "hc_mult", 1)
         hc_dim = self.hc_mult * config.hidden_size
 
-        self.attn = DeepSeekV4MLAttention(config, layer_idx=layer_idx)
+        self.attn = DeepSeekV4SharedKVAttention(config, layer_idx=layer_idx)
         self.mlp = DeepSeekV4MLP(config)
 
         self.attn_norm = RMSNorm(config.hidden_size, eps=getattr(config, "rms_norm_eps", 1e-6))
@@ -332,6 +339,8 @@ class DeepSeekV4DSparkDecoderLayer(nn.Module):
             self.hc_ffn_fn = nn.Parameter(torch.empty(self.hc_mult, hc_dim))
             self.hc_ffn_base = nn.Parameter(torch.empty(self.hc_mult))
             self.hc_ffn_scale = nn.Parameter(torch.ones(1))
+            init_hc_parameters(self.hc_attn_fn, self.hc_attn_base, self.hc_attn_scale)
+            init_hc_parameters(self.hc_ffn_fn, self.hc_ffn_base, self.hc_ffn_scale)
         else:
             self.hc_attn_fn = self.hc_attn_base = self.hc_attn_scale = None
             self.hc_ffn_fn = self.hc_ffn_base = self.hc_ffn_scale = None
@@ -390,9 +399,8 @@ class DeepSeekV4DSparkDecoderLayer(nn.Module):
 class DeepSeekV4DSparkModel(PreTrainedModel):
     """Standalone DSpark draft model for DeepSeek-V4 Flash.
 
-    Shares the MLA / MoE / hyper-connection architecture of the target model
-    but uses only a small number of draft layers (default 1, matching the
-    official ``mtp.0`` design).
+    Follows the Ascend DeepSeek-V4-Flash DSpark layout while keeping the
+    training path in PyTorch/SDPA instead of NPU custom inference kernels.
 
     Interface-compatible with :class:`Qwen3DSparkModel` so the existing
     trainer and evaluator can use it without changes.
@@ -446,6 +454,17 @@ class DeepSeekV4DSparkModel(PreTrainedModel):
         self.block_size = int(config.block_size)
         self.mask_token_id = config.mask_token_id
         self.num_anchors = int(config.num_anchors)
+        self.hc_eps = float(getattr(config, "hc_eps", 1e-6))
+
+        # Official DSpark uses a learned HC head mixer before the final norm.
+        if self.hc_mult > 1:
+            hc_dim = self.hc_mult * config.hidden_size
+            self.hc_head_fn = nn.Parameter(torch.empty(self.hc_mult, hc_dim))
+            self.hc_head_base = nn.Parameter(torch.empty(self.hc_mult))
+            self.hc_head_scale = nn.Parameter(torch.ones(1))
+            init_hc_parameters(self.hc_head_fn, self.hc_head_base, self.hc_head_scale)
+        else:
+            self.hc_head_fn = self.hc_head_base = self.hc_head_scale = None
 
         # Markov head.
         self.markov_head = build_markov_head(config)
@@ -513,6 +532,26 @@ class DeepSeekV4DSparkModel(PreTrainedModel):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)
+
+    def fold_hc_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Fold HC streams with the same learned head mixer used by DSpark."""
+        if self.hc_mult <= 1:
+            return hidden_states
+
+        orig_dtype = hidden_states.dtype
+        bsz, seq_len, _, hidden_size = hidden_states.shape
+        flat = hidden_states.flatten(2).float()
+        rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm.eps)
+        mixes = torch.nn.functional.linear(flat, self.hc_head_fn.float()) * rsqrt
+        weights = torch.sigmoid(
+            mixes * self.hc_head_scale.float() + self.hc_head_base.float()
+        ) + self.hc_eps
+        folded = torch.sum(
+            weights.unsqueeze(-1)
+            * flat.view(bsz, seq_len, self.hc_mult, hidden_size),
+            dim=2,
+        )
+        return folded.to(orig_dtype)
 
     def predict_confidence_step(
         self,
@@ -603,9 +642,9 @@ class DeepSeekV4DSparkModel(PreTrainedModel):
                 **kwargs,
             )
 
-        # Mean-fold hyper-connection streams (matching prepare_target_cache).
+        # Official DSpark folds HC streams with a learned head mixer before norm.
         if self.hc_mult > 1:
-            hidden_states = hidden_states.mean(dim=2)
+            hidden_states = self.fold_hc_head(hidden_states)
 
         return self.norm(hidden_states)
 
@@ -744,5 +783,9 @@ class DeepSeekV4DSparkModel(PreTrainedModel):
 __all__ = [
     "DeepSeekV4DSparkModel",
     "DeepSeekV4DSparkDecoderLayer",
+    "DeepSeekV4SharedKVAttention",
     "DeepSeekV4MLAttention",
 ]
+
+
+DeepSeekV4MLAttention = DeepSeekV4SharedKVAttention

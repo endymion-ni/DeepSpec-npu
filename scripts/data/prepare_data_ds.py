@@ -3,7 +3,7 @@
 
 Generates random hidden states shaped according to the target model config.
 Each sample contains complete hidden states for all captured target layers
-(target_layer_ids = [2, 21, 40], i.e. 3 layers), plus the final last_hidden_state.
+(target_layer_ids = [40, 41, 42], i.e. 3 layers), plus the final last_hidden_state.
 
 Usage::
 
@@ -48,7 +48,7 @@ from deepspec.data.target_cache_dataset import (  # noqa: E402
 # Defaults sourced from config/dspark/dspark_deepseek_v4_flash.py and
 # models/deepseek_v4_flash_hf_config/config.json
 # ---------------------------------------------------------------------------
-DEFAULT_TARGET_LAYER_IDS = [2, 21, 40]  # 3 mid-decoder layers
+DEFAULT_TARGET_LAYER_IDS = [40, 41, 42]  # Ascend DSpark target layers
 DEFAULT_HIDDEN_SIZE = 4096
 DEFAULT_VOCAB_SIZE = 129280
 DEFAULT_MAX_LENGTH = 4096
@@ -274,7 +274,7 @@ def main() -> None:
             "max_length": seq_len,
             "min_loss_tokens": int(args.min_loss_tokens),
             "project_name": "deepspec",
-            "exp_name": "dspark_block7_deepseek_v4_flash_synthetic",
+            "exp_name": "dspark_block5_deepseek_v4_flash_synthetic",
             "git_sha": "synthetic",
         },
     )
