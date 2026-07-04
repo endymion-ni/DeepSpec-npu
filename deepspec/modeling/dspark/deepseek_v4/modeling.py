@@ -261,31 +261,75 @@ class DSparkAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Dense MLP (stand-in for MoE during training)
+# MoE — matches official ``DeepseekV3MoE`` in cann-recipes (training fallback)
 # ---------------------------------------------------------------------------
 
-class DeepSeekV4MLP(nn.Module):
-    """Dense SwiGLU MLP — training-friendly replacement for the 256-expert MoE.
+class DSparkMoE(nn.Module):
+    """Structurally matches ``DeepseekV3MoE`` / ``DeepseekV3SharedExpert``.
 
-    During inference the official model uses ``MoEGMM`` (FP4 quantised MoE).
-    For training we use a dense FFN; the MoE can be enabled later via a config
-    flag.
+    Checkpoint keys (per layer):
+        ``ffn.gate.weight``, ``ffn.gate.bias`` — routing gate
+        ``ffn.experts.{eid}.w1/w2/w3.*`` — 256 routed experts (FP4)
+        ``ffn.shared_experts.w1/w2/w3.*`` — shared expert
+
+    During training the routed experts are replaced with a single dense
+    SwiGLU FFN.  The gate is created but unused until top-k routing is
+    enabled.  Shared expert is a separate dense branch (additive residual).
     """
 
-    def __init__(self, config):
+    def __init__(self, config, prefix: str = ""):
         super().__init__()
+        _ = prefix  # kept for canonical alignment with official loaders
         self.hidden_size = config.hidden_size
         self.intermediate_size = getattr(
-            config, "moe_intermediate_size", config.hidden_size * 4
+            config, "moe_intermediate_size", config.hidden_size * 4,
         )
+        self.num_experts = getattr(config, "n_routed_experts", 256)
+        self.num_experts_per_tok = getattr(config, "num_experts_per_tok", 6)
+        self.n_shared_experts = getattr(config, "n_shared_experts", 1)
+
+        # Routing gate (unused in dense fallback; kept for weight loading).
+        self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
+
+        # Dense "routed expert" — single SwiGLU (training fallback for 256 experts).
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Shared expert.
+        if self.n_shared_experts > 0:
+            self.shared_gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+            self.shared_up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+            self.shared_down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        else:
+            self.shared_gate_proj = None
+            self.shared_up_proj = None
+            self.shared_down_proj = None
+
+    def _dense_expert(self, x: torch.Tensor) -> torch.Tensor:
         gate = torch.nn.functional.silu(self.gate_proj(x))
         up = self.up_proj(x)
         return self.down_proj(gate * up)
+
+    def _shared_expert(self, x: torch.Tensor) -> torch.Tensor:
+        if self.shared_gate_proj is None:
+            return 0.0
+        gate = torch.nn.functional.silu(self.shared_gate_proj(x))
+        up = self.shared_up_proj(x)
+        return self.shared_down_proj(gate * up)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        is_prefill: bool = False,
+        cur_topk_list=None,
+        input_ids=None,
+        shared_expert_stream=None,
+    ):
+        """Official MoE forward signature.  Dense fallback ignores routing."""
+        y = self._dense_expert(hidden_states)
+        y = y + self._shared_expert(hidden_states)
+        return y
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +479,7 @@ class DeepSeekV4DSparkDecoderLayer(nn.Module):
         hc_dim = self.hc_mult * config.hidden_size
 
         self.attn = DSparkAttention(config, layer_idx=layer_idx)
-        self.mlp = DeepSeekV4MLP(config)
+        self.mlp = DSparkMoE(config, prefix=f"mtp.{layer_idx}.ffn")
 
         self.attn_norm = RMSNorm(config.hidden_size, eps=self.norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, eps=self.norm_eps)
@@ -887,6 +931,7 @@ class DeepSeekV4DSparkModel(PreTrainedModel):
 
 __all__ = [
     "DSparkAttention",
+    "DSparkMoE",
     "DeepSeekV4DSparkModel",
     "DeepSeekV4DSparkDecoderLayer",
     "DeepSeekV4MLAttention",
