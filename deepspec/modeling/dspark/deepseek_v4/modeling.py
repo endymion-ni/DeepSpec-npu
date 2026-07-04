@@ -275,33 +275,124 @@ class DeepSeekV4MLP(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Hyper-Connection (simplified for training)
+# Hyper-Connection — OpKernel dispatch (fused AscendC / PyPTO when available)
 # ---------------------------------------------------------------------------
 
-def hc_fuse(
-    x: torch.Tensor,
-    fn_weight: torch.Tensor,
-    scale: torch.Tensor,
-    base: torch.Tensor,
-) -> torch.Tensor:
-    """Hyper-connection mixing across ``hc_mult`` residual streams.
 
-    *x*: (bsz, seq_len, hc_mult, hidden_size)
-    *fn_weight*: (hc_mult, hc_mult * hidden_size)
-    *scale*: (1,) output scale
-    *base*: (hc_mult,) per-stream bias
+class _OpKernel:
+    """Dispatcher matching ``cann-recipes-infer_dspark`` OpKernel HC API.
+
+    Production: fused AscendC / PyPTO kernels (``npu_hc_pre``, ``npu_hc_post``).
+    Fallback: pure-PyTorch native path (this file).  The signatures deliberately
+    mirror ``models/deepseek-v4/models/modules/op_impls/mhc.py`` so that
+    swapping in the real fused kernels requires only changing the backend.
     """
-    hc_mult, hidden = x.shape[2], x.shape[3]
-    # W: (hc_mult, hc_mult * hidden) → (hc_mult, hc_mult, hidden)
-    w = fn_weight.view(hc_mult, hc_mult, hidden)
-    # Mix across streams: out[:,:,i,:] = sum_j(x[:,:,j,:] * W[i,j,:])
-    out = torch.einsum("bsjh,ijh->bsih", x, w)
-    out = out * scale + base.view(1, 1, hc_mult, 1)
-    return out
+
+    @staticmethod
+    def hc_pre(x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps):
+        """Pre-sublayer HC: fold ``hc_mult``→1 via learned mixing + Sinkhorn.
+
+        *x*: (bsz, seq_len, hc_mult, hidden_size).
+        *hc_fn*: (mix_hc, hc_mult * hidden_size) where ``mix_hc = (2+hc)*hc``.
+        *hc_scale*: (3,).  *hc_base*: (mix_hc,).
+        Returns ``(y, post, comb)`` — *y* shape (bsz, seq_len, hidden_size).
+        """
+        return hc_pre_native(
+            x, hc_fn, hc_scale, hc_base,
+            hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps,
+        )
+
+    @staticmethod
+    def hc_post(x, residual, post, comb):
+        """Post-sublayer HC: expand 1→``hc_mult``.
+
+        *x*: (bsz, seq_len, hidden_size).  *residual*: (bsz, seq_len, hc_mult, hidden_size).
+        *post*: (bsz, seq_len, hc_mult).  *comb*: (bsz, seq_len, hc_mult, hc_mult).
+        Returns (bsz, seq_len, hc_mult, hidden_size).
+        """
+        return hc_post_native(x, residual, post, comb)
 
 
-def init_hc_parameters(fn_weight: torch.Tensor, base: torch.Tensor, scale: torch.Tensor):
-    """Initialize custom HC parameters that ``post_init`` does not see."""
+def hc_split_sinkhorn(
+    mixes: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int = 4,
+    sinkhorn_iters: int = 20,
+    eps: float = 1e-6,
+):
+    """Pure-PyTorch Sinkhorn decomposition — matches tilelang kernel
+    ``hc_split_sinkhorn`` in cann-recipes.
+
+    Reference: ``ops/tilelang/ds_v4/hc_split_sinkhorn.py`` and
+    ``models/deepseek-v4/models/modules/op_impls/mhc.py``.
+    """
+    pre, post, comb = mixes.split([hc_mult, hc_mult, hc_mult * hc_mult], dim=-1)
+    comb = comb.unflatten(-1, (hc_mult, hc_mult))
+
+    pre = torch.sigmoid(pre * hc_scale[0] + hc_base[:hc_mult]) + eps
+    post = 2.0 * torch.sigmoid(post * hc_scale[1] + hc_base[hc_mult:2 * hc_mult])
+    comb = comb * hc_scale[2] + hc_base[2 * hc_mult:].view(hc_mult, hc_mult)
+
+    comb = comb.softmax(-1) + eps
+    col_sum = comb.sum(-2, keepdim=True)
+    comb = comb / (col_sum + eps)
+    for _ in range(sinkhorn_iters - 1):
+        row_sum = comb.sum(-1, keepdim=True)
+        comb = comb / (row_sum + eps)
+        col_sum = comb.sum(-2, keepdim=True)
+        comb = comb / (col_sum + eps)
+    return pre, post, comb
+
+
+def hc_pre_native(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int = 4,
+    sinkhorn_iters: int = 20,
+    norm_eps: float = 1e-6,
+    hc_eps: float = 1e-6,
+):
+    """``hc_pre`` native fallback — matches ``hc_pre_native`` in mhc.py."""
+    shape, dtype = x.size(), x.dtype
+    x_flat = x.flatten(2).float()
+    rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + norm_eps)
+    mixes = torch.nn.functional.linear(x_flat, hc_fn.float()) * rsqrt
+
+    pre, post, comb = hc_split_sinkhorn(
+        mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps,
+    )
+    y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
+    return y.to(dtype), post, comb
+
+
+def hc_post_native(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+):
+    """``hc_post`` native fallback — matches ``hc_post_native`` in mhc.py."""
+    y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(
+        comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2,
+    )
+    return y.type_as(x)
+
+
+def init_hc_parameters(
+    fn_weight: torch.Tensor,
+    base: torch.Tensor,
+    scale: torch.Tensor,
+    mix_hc: int,
+):
+    """Initialize HC parameters with ``mix_hc``-sized tensors.
+
+    *fn_weight*: (mix_hc, hc_mult * hidden) — mixing projection.
+    *base*: (mix_hc,) — per-dim bias.
+    *scale*: (3,) — per-group scale.
+    """
     nn.init.normal_(fn_weight, mean=0.0, std=0.02)
     nn.init.zeros_(base)
     nn.init.ones_(scale)
@@ -323,34 +414,32 @@ class DeepSeekV4DSparkDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.hc_mult = getattr(config, "hc_mult", 1)
+        self.hc_sinkhorn_iters = getattr(config, "hc_sinkhorn_iters", 20)
+        self.hc_eps = getattr(config, "hc_eps", 1e-6)
+        self.norm_eps = getattr(config, "rms_norm_eps", 1e-6)
+        mix_hc = (2 + self.hc_mult) * self.hc_mult
         hc_dim = self.hc_mult * config.hidden_size
 
         self.attn = DeepSeekV4SharedKVAttention(config, layer_idx=layer_idx)
         self.mlp = DeepSeekV4MLP(config)
 
-        self.attn_norm = RMSNorm(config.hidden_size, eps=getattr(config, "rms_norm_eps", 1e-6))
-        self.ffn_norm = RMSNorm(config.hidden_size, eps=getattr(config, "rms_norm_eps", 1e-6))
+        self.attn_norm = RMSNorm(config.hidden_size, eps=self.norm_eps)
+        self.ffn_norm = RMSNorm(config.hidden_size, eps=self.norm_eps)
 
-        # Hyper-connection weights (per-stream mixing after attn / ffn).
+        # Hyper-connection weights matching official DSpark shapes.
+        # mix_hc = pre(hc) + post(hc) + comb(hc*hc) = 4+4+16 = 24.
         if self.hc_mult > 1:
-            self.hc_attn_fn = nn.Parameter(torch.empty(self.hc_mult, hc_dim))
-            self.hc_attn_base = nn.Parameter(torch.empty(self.hc_mult))
-            self.hc_attn_scale = nn.Parameter(torch.ones(1))
-            self.hc_ffn_fn = nn.Parameter(torch.empty(self.hc_mult, hc_dim))
-            self.hc_ffn_base = nn.Parameter(torch.empty(self.hc_mult))
-            self.hc_ffn_scale = nn.Parameter(torch.ones(1))
-            init_hc_parameters(self.hc_attn_fn, self.hc_attn_base, self.hc_attn_scale)
-            init_hc_parameters(self.hc_ffn_fn, self.hc_ffn_base, self.hc_ffn_scale)
+            self.hc_attn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim))
+            self.hc_attn_base = nn.Parameter(torch.empty(mix_hc))
+            self.hc_attn_scale = nn.Parameter(torch.empty(3))
+            self.hc_ffn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim))
+            self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc))
+            self.hc_ffn_scale = nn.Parameter(torch.empty(3))
+            init_hc_parameters(self.hc_attn_fn, self.hc_attn_base, self.hc_attn_scale, mix_hc)
+            init_hc_parameters(self.hc_ffn_fn, self.hc_ffn_base, self.hc_ffn_scale, mix_hc)
         else:
             self.hc_attn_fn = self.hc_attn_base = self.hc_attn_scale = None
             self.hc_ffn_fn = self.hc_ffn_base = self.hc_ffn_scale = None
-
-    def _hc_residual(self, x, residual, fn_w, scale, base):
-        """Apply hyper-connection mixing and add to residual stream."""
-        if self.hc_mult > 1:
-            mixed = hc_fuse(x, fn_w, scale, base)
-            return residual + mixed
-        return residual + x
 
     def forward(
         self,
@@ -365,6 +454,10 @@ class DeepSeekV4DSparkDecoderLayer(nn.Module):
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
+        hidden_states, post, comb = _OpKernel.hc_pre(
+            hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
+            self.hc_mult, self.hc_sinkhorn_iters, self.norm_eps, self.hc_eps,
+        )
         hidden_states = self.attn_norm(hidden_states)
         hidden_states = self.attn(
             hidden_states=hidden_states,
@@ -377,18 +470,16 @@ class DeepSeekV4DSparkDecoderLayer(nn.Module):
             position_embeddings=position_embeddings,
             **kwargs,
         )[0]
-        hidden_states = self._hc_residual(
-            hidden_states, residual,
-            self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
-        )
+        hidden_states = _OpKernel.hc_post(hidden_states, residual, post, comb)
 
         residual = hidden_states
+        hidden_states, post, comb = _OpKernel.hc_pre(
+            hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
+            self.hc_mult, self.hc_sinkhorn_iters, self.norm_eps, self.hc_eps,
+        )
         hidden_states = self.ffn_norm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = self._hc_residual(
-            hidden_states, residual,
-            self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
-        )
+        hidden_states = _OpKernel.hc_post(hidden_states, residual, post, comb)
         return hidden_states
 
 
@@ -462,7 +553,10 @@ class DeepSeekV4DSparkModel(PreTrainedModel):
             self.hc_head_fn = nn.Parameter(torch.empty(self.hc_mult, hc_dim))
             self.hc_head_base = nn.Parameter(torch.empty(self.hc_mult))
             self.hc_head_scale = nn.Parameter(torch.ones(1))
-            init_hc_parameters(self.hc_head_fn, self.hc_head_base, self.hc_head_scale)
+            # hc_head uses (hc_mult, hc_dim) not (mix_hc, hc_dim) — sigmoid only.
+            nn.init.normal_(self.hc_head_fn, mean=0.0, std=0.02)
+            nn.init.zeros_(self.hc_head_base)
+            nn.init.ones_(self.hc_head_scale)
         else:
             self.hc_head_fn = self.hc_head_base = self.hc_head_scale = None
 
@@ -534,24 +628,21 @@ class DeepSeekV4DSparkModel(PreTrainedModel):
         return self.lm_head(hidden_states)
 
     def fold_hc_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Fold HC streams with the same learned head mixer used by DSpark."""
+        """Fold HC streams — matches official ``DSparkDraftBlock.forward_head_hidden``."""
         if self.hc_mult <= 1:
             return hidden_states
 
         orig_dtype = hidden_states.dtype
-        bsz, seq_len, _, hidden_size = hidden_states.shape
+        bsz, seq_len, hc_mult, _ = hidden_states.shape
+        eps = getattr(self.config, "hc_eps", 1e-6)
+        norm_eps = getattr(self.config, "rms_norm_eps", 1e-6)
+
         flat = hidden_states.flatten(2).float()
-        rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm.eps)
+        rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + norm_eps)
         mixes = torch.nn.functional.linear(flat, self.hc_head_fn.float()) * rsqrt
-        weights = torch.sigmoid(
-            mixes * self.hc_head_scale.float() + self.hc_head_base.float()
-        ) + self.hc_eps
-        folded = torch.sum(
-            weights.unsqueeze(-1)
-            * flat.view(bsz, seq_len, self.hc_mult, hidden_size),
-            dim=2,
-        )
-        return folded.to(orig_dtype)
+        pre = torch.sigmoid(mixes * self.hc_head_scale.float() + self.hc_head_base.float()) + eps
+        y = torch.sum(pre.unsqueeze(-1) * flat.view(bsz, seq_len, hc_mult, -1), dim=2)
+        return y.to(orig_dtype)
 
     def predict_confidence_step(
         self,
