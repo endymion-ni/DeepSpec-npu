@@ -8,6 +8,7 @@
 - **软件**: torch_npu, HCCL
 - **训练配置**: `config/dspark/dspark_deepseek_v4_flash.py`
 - **官方模型**: [DeepSeek-V4-Flash-DSpark](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-DSpark)
+- **参考实现**: `cann-recipes-infer_dspark/models/deepseek-v4/`
 
 ## 架构概览
 
@@ -29,24 +30,64 @@ train.py → DeepSeekV4DSparkTrainer
 |------|---------------------|------------------------|
 | 模型类 | `Qwen3DSparkModel` | `DeepSeekV4DSparkModel` |
 | 配置构建 | `build_draft_config` (Qwen3 base) | `build_draft_config` (clone target config) |
-| Attention | Dense MHA: 32 heads, 8 KV, head_dim=128 | **Shared-KV/MQA**: 64 heads, 1 KV, head_dim=512, q_lora_rank=1024, o_lora_rank=1024 |
-| FFN | Dense SwiGLU (intermediate=12288) | Dense SwiGLU (intermediate=2048, 训练期替 MoE) |
+| Attention | Dense MHA: 32 heads, 8 KV, head_dim=128 | **DSparkAttention**: 64 heads, 1 KV (MQA), head_dim=512, q_lora_rank=1024, o_lora_rank=1024 |
+| FFN | Dense SwiGLU (intermediate=12288) | **DSparkMoE**: Gate + Dense SwiGLU (训练替 256-expert MoE) + Shared Expert |
 | Position | Qwen3 RoPE (`rope_parameters`) | 自建 RoPE (无 Qwen3 依赖) |
-| Residual | Standard residual | **Hyper-Connection** (hc_mult=4) |
+| Residual | Standard residual | **Hyper-Connection**: hc_mult=4, Sinkhorn 20 轮 |
 | HF 序列化 | Qwen3PreTrainedModel | PreTrainedModel + DeepseekV4Config |
+
+### cann-recipes-infer_dspark 对齐
+
+Attention、MoE、HC 三大模块已按 `cann-recipes-infer_dspark/models/deepseek-v4/` 重构，结构完全对齐生产推理代码，便于后续融合算子替换：
+
+#### Hyper-Connection — `_OpKernel` 调度
+
+```
+_OpKernel.hc_pre / hc_post    ← 融合算子入口（生产: AscendC/PyPTO）
+  └── hc_pre_native / hc_post_native  ← 纯 PyTorch fallback
+        └── hc_split_sinkhorn          ← Sinkhorn 20 轮分解
+```
+
+| 参数 | Shape | 说明 |
+|------|-------|------|
+| `hc_attn_fn`, `hc_ffn_fn` | `(24, 16384)` | `mix_hc = (2+hc)*hc`，pre(4) + post(4) + comb(16) |
+| `hc_attn_base`, `hc_ffn_base` | `(24,)` | 对齐生产 |
+| `hc_attn_scale`, `hc_ffn_scale` | `(3,)` | pre/post/comb 各独立 scale |
+| `hc_head_fn` (模型级) | `(4, 16384)` | sigmoid 门控降维，不含 Sinkhorn |
+
+参考文件: `cann-recipes-infer_dspark/models/deepseek-v4/models/modules/op_impls/mhc.py`
+
+#### DSparkAttention
+
+| 方法 | 官方对应 | 说明 |
+|------|---------|------|
+| `_project_dspark_q(x, cos, sin)` | `_project_dspark_q` | wq_a → q_norm → wq_b → QK-norm → RoPE |
+| `_project_dspark_kv(x, cos, sin)` | `_project_dspark_kv` | wkv → kv_norm → RoPE, 返回 `(kv_nope, kv_rope)` |
+| `attn_sink` | `attn_sink` | `nn.Parameter(zeros(n_heads))` |
+| Attention 计算 | `F.scaled_dot_product_attention` | 训练期 dense SDPA (生产用 sparse_attn kernel) |
+
+参考文件: `cann-recipes-infer_dspark/models/deepseek-v4/models/dspark_modeling.py` → `DSparkAttention`
+
+#### DSparkMoE
+
+| 参数 | 官方 checkpoint key |
+|------|-------------------|
+| `gate` (Linear) | `ffn.gate.weight` |
+| `gate_proj/up_proj/down_proj` (dense routed expert) | `ffn.experts.{0..255}.w1/w2/w3` (256-expert dense 替) |
+| `shared_gate_proj/up_proj/down_proj` | `ffn.shared_experts.w1/w2/w3` |
+| forward 签名 | `forward(hidden_states, is_prefill, cur_topk_list, input_ids, shared_expert_stream)` |
+
+参考文件: `cann-recipes-infer_dspark/models/deepseek-v4/models/modeling_deepseek.py` → `DeepseekV3MoE`
 
 ### 官方 DSpark 简化项
 
-当前模型相对官方 `DeepSeek-V4-Flash-DSpark` 的 `mtp.0` 层做了以下简化，目的是先打通训练流程，后续逐步补全：
-
 | 组件 | 官方 | 当前 | 影响 |
 |------|------|------|------|
-| FFN | 256-expert MoE + FP4 量化 | Dense SwiGLU MLP | 参数多 ~50 倍 (但无量化)，FLOPs ↑ |
-| Attention | `sparse_attn` (tilelang CUDA): KV 压缩 + Indexer top-512 稀疏 | `F.scaled_dot_product_attention`: 全 dense | O(n²) vs O(n)，长序列显著变慢 |
-| HC | HC Sinkhorn 迭代 (20 轮归一化) | 简化 `einsum` 线性混合 | Sinkhorn 归一化是 DSv4 特有机制 |
-| KV Cache | Window + Compressor 管理 | 训练不用 KV cache | 无 |
-| 量化 | FP8 K/V/Q 量化 | bf16 全精度 | 训练不需要量化 |
-| 采样 | Gumbel-max 采样 | 训练不涉及 | 无 |
+| FFN 专家 | 256-expert MoE + FP4 | Gate + Dense SwiGLU + Shared Expert | 结构就位，待替换 dense 为 top-k routed experts |
+| Attention | `sparse_attn` (KV 压缩 + top-512) | `F.scaled_dot_product_attention` (dense) | O(n²) vs O(n)，长序列变慢 |
+| HC 融合算子 | AscendC `npu_hc_pre` / PyPTO | `hc_pre_native` (纯 PyTorch) | 同计算逻辑，性能差距 |
+| KV Cache | Window + Compressor | 训练不用 | 无 |
+| 量化 | FP8 K/V/Q, FP4 experts | bf16 全精度 | 训练不需要 |
 
 ## 核心 NPU 适配改动
 
@@ -109,8 +150,8 @@ draft_model.set_embedding_head_trainable(False)
 
 | 文件 | 说明 |
 |------|------|
-| `modeling.py` | `DeepSeekV4DSparkModel` — Shared-KV/MQA + HC + 自建 RoPE，继承 `PreTrainedModel`，支持 `save_pretrained` / `from_pretrained` |
-| `config.py` | `build_draft_config` — 直接从 target config clone，只改层数和 DSpark 字段，保留全部 Shared-KV/MQA/MoE/HC 原生维度 |
+| `modeling.py` | `DSparkAttention` (MQA + attn_sink)、`DSparkMoE` (Gate + dense + shared)、`_OpKernel` HC dispatch、`DeepSeekV4DSparkModel` |
+| `config.py` | `build_draft_config` — 直接从 target config clone，保留原生维度 |
 
 ### 推理 eval (`deepspec/eval/`)
 
@@ -174,11 +215,11 @@ bash scripts/train/train_single.sh
 
 | 文件 | 改动 |
 |------|------|
-| `deepspec/modeling/dspark/deepseek_v4/config.py` | flex_attention → sdpa (NPU)；`build_draft_config` 改为 clone target config；截断 per-layer 列表 |
-| `deepspec/modeling/dspark/deepseek_v4/modeling.py` | **新建** — `DeepSeekV4DSparkModel` (Shared-KV/MQA + HC + DeepSeekV4RotaryEmbedding) |
+| `deepspec/modeling/dspark/deepseek_v4/modeling.py` | **新建** — `DSparkAttention` (MQA + attn_sink)、`DSparkMoE` (Gate + dense + shared expert)、`_OpKernel` HC dispatch、`DeepSeekV4DSparkModel` |
+| `deepspec/modeling/dspark/deepseek_v4/config.py` | flex_attention → sdpa (NPU)；`build_draft_config` clone target config |
 | `deepspec/modeling/dspark/common.py` | `_arange()` int32 索引；`create_noise_embed` IndexPut dtype 修复；`sample_anchor_positions` int32 anchors |
-| `deepspec/trainer/base_trainer.py` | torch.compile NPU 跳过；单卡 FSDP 跳过；单卡 dist.barrier 保护；grad_norm 无 FSDP fallback |
-| `deepspec/trainer/dspark_trainer.py` | `DeepSeekV4DSparkTrainer.build_models()` 直接读 safetensors 权重；使用 `DeepSeekV4DSparkModel` |
+| `deepspec/trainer/base_trainer.py` | torch.compile NPU 跳过；单卡 FSDP 跳过；单卡 dist.barrier 保护 |
+| `deepspec/trainer/dspark_trainer.py` | `DeepSeekV4DSparkTrainer.build_models()` 直接读 safetensors 权重 |
 | `deepspec/trainer/ckpt_manager.py` | 单卡 dist.barrier 保护；非 FSDP state_dict 支持 |
 | `deepspec/utils/metrics.py` | 单卡 all_reduce/all_gather 跳过 |
 
@@ -205,8 +246,8 @@ bash scripts/train/train_single.sh
 
 1. **FSDP 跳过**：当前单卡完全跳过 FSDP，多卡训练需验证 NPU HCCL 兼容性
 2. **torch.compile**：NPU 上未启用，待 torch_npu 版本更新后测试
-3. **FFN 简化**：使用 Dense SwiGLU 替代 256-expert MoE，需后续替换以对齐官方效果
-4. **HC 简化**：使用线性 `einsum` 混合替代 HC Sinkhorn 20 轮迭代
-5. **Attention**：使用 dense SDPA 替代 `sparse_attn`，长序列性能差
+3. **FFN 简化**：Gate + dense SwiGLU 替 256-expert MoE，需后续实现 top-k routing
+4. **HC 融合算子**：纯 PyTorch native 路径，生产环境替换 `_OpKernel` 为 AscendC/PyPTO 实现
+5. **Attention**：Dense SDPA 替 `sparse_attn`，长序列性能较差
 6. **`UserWarning: Cannot create tensor with interal format`**：`torch.full_like` 在 NPU 上的非关键告警
 7. **权重加载**：仅加载 `embed_tokens` 和 `lm_head`，draft 层随机初始化，需完整真实 target cache 进行有效训练
