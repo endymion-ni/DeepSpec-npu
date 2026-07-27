@@ -80,7 +80,7 @@ train = dict(
     num_train_epochs=10,
     max_train_steps=None,
     max_grad_norm=1.0,
-    sharding_strategy="no_shard",
+    sharding_strategy="full_shard",
     torch_compile=True,
 )
 

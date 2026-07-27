@@ -38,10 +38,10 @@ NPROCS=${NPROCS:-1}
 #   config/eagle3/eagle3_qwen3_8b.py
 #   config/eagle3/eagle3_qwen3_14b.py
 
-config_path=${config_path:-config/dspark/dspark_gemma4_12b.py}
-target_model_path=${target_model_path:-google/gemma-4-12B-it}
-target_cache_dir=${target_cache_dir:-${HOME}/.cache/deepspec/gemma4_target_cache}
-target_layer_ids=${target_layer_ids:-}
+config_path=${config_path:-config/dspark/dspark_deepseek_v4_flash.py}
+target_model_path=${target_model_path:-deepseek-ai/DeepSeek-V4-Flash}
+target_cache_dir=${target_cache_dir:-${HOME}/.cache/deepspec/deepseek_v4_target_cache}
+target_layer_ids=${target_layer_ids:40,41,42}
 global_batch_size=${global_batch_size:-512}
 max_train_steps=${max_train_steps:-}
 data_max_length=${data_max_length:-4096}

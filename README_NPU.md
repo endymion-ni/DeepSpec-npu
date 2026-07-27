@@ -31,7 +31,7 @@ train.py → DeepSeekV4DSparkTrainer
 | 模型类 | `Qwen3DSparkModel` | `DeepSeekV4DSparkModel` |
 | 配置构建 | `build_draft_config` (Qwen3 base) | `build_draft_config` (clone target config) |
 | Attention | Dense MHA: 32 heads, 8 KV, head_dim=128 | **DSparkAttention**: 64 heads, 1 KV (MQA), head_dim=512, q_lora_rank=1024, o_lora_rank=1024 |
-| FFN | Dense SwiGLU (intermediate=12288) | **DSparkMoE**: Gate + Dense SwiGLU (训练替 256-expert MoE) + Shared Expert |
+| FFN | Dense SwiGLU (intermediate=12288) | **DSparkMoE**: Gate + 256 个 top-k routed experts + Shared Expert |
 | Position | Qwen3 RoPE (`rope_parameters`) | 自建 RoPE (无 Qwen3 依赖) |
 | Residual | Standard residual | **Hyper-Connection**: hc_mult=4, Sinkhorn 20 轮 |
 | HF 序列化 | Qwen3PreTrainedModel | PreTrainedModel + DeepseekV4Config |
@@ -72,10 +72,35 @@ _OpKernel.hc_pre / hc_post    ← 融合算子入口（生产: AscendC/PyPTO）
 
 | 参数 | 官方 checkpoint key |
 |------|-------------------|
-| `gate` (Linear) | `ffn.gate.weight` |
-| `gate_proj/up_proj/down_proj` (dense routed expert) | `ffn.experts.{0..255}.w1/w2/w3` (256-expert dense 替) |
-| `shared_gate_proj/up_proj/down_proj` | `ffn.shared_experts.w1/w2/w3` |
+| `gate` (Linear + correction bias) | `ffn.gate.weight` / `ffn.gate.e_score_correction_bias` |
+| `experts.{0..255}.w1/w2/w3` | `ffn.experts.{0..255}.w1/w2/w3` |
+| `shared_experts.w1/w2/w3` | `ffn.shared_experts.w1/w2/w3` |
 | forward 签名 | `forward(hidden_states, is_prefill, cur_topk_list, input_ids, shared_expert_stream)` |
+
+训练实现与推理侧保持相同的 scoring、`noaux_tc`/greedy top-k、概率归一化和
+`routed_scaling_factor` 语义，仅将量化 GMM 与 EP dispatch/combine 替换为可微的
+PyTorch 稀疏专家调度。DeepSeek-V4-Flash 每个 token 激活 6/256 个 routed experts，
+并叠加 1 个 shared expert。
+
+> **训练资源约束**：三个 DSpark MoE 层约含 194 亿参数，单 BF16 权重约
+> 36.2 GiB；当前 `BF16Optimizer` 的 FP32 master 参数与 AdamW 状态会把仅
+> MoE 的常驻状态提高到约 253 GiB（尚未包含梯度和激活）。完整 256-expert
+> 训练不能使用单卡或 `no_shard`，需要多卡参数/优化器分片，并建议进一步接入
+> 与推理侧一致的 Expert Parallel dispatch/combine。
+
+DeepSeek-V4 DSpark 默认配置现使用 `sharding_strategy="full_shard"`。FSDP
+包装后，每个 rank 会记录 draft model 的本地参数视图：
+
+```text
+[rank 0] FSDP draft parameter view: strategy=full_shard, sharded=yes,
+local_total_numel=.../... (...%), local_trainable_numel=.../...,
+local_parameter_gib=.../...
+FSDP draft parameter sharding summary: strategy=full_shard, world_size=...,
+pre_wrap_total_numel=..., sum_rank_local_numel=..., replication_factor=...
+```
+
+`sharded=yes` 且 `replication_factor` 接近 1 表示各 rank 合计约为一份完整参数；
+若复制系数接近 `world_size`，则参数仍然是全量复制。
 
 参考文件: `cann-recipes-infer_dspark/models/deepseek-v4/models/modeling_deepseek.py` → `DeepseekV3MoE`
 
@@ -83,7 +108,7 @@ _OpKernel.hc_pre / hc_post    ← 融合算子入口（生产: AscendC/PyPTO）
 
 | 组件 | 官方 | 当前 | 影响 |
 |------|------|------|------|
-| FFN 专家 | 256-expert MoE + FP4 | Gate + Dense SwiGLU + Shared Expert | 结构就位，待替换 dense 为 top-k routed experts |
+| FFN 专家 | 256-expert MoE + FP4 | 256-expert top-k MoE + Shared Expert（BF16） | 计算语义对齐；未使用推理量化/GMM/EP 融合 |
 | Attention | `sparse_attn` (KV 压缩 + top-512) | `F.scaled_dot_product_attention` (dense) | O(n²) vs O(n)，长序列变慢 |
 | HC 融合算子 | AscendC `npu_hc_pre` / PyPTO | `hc_pre_native` (纯 PyTorch) | 同计算逻辑，性能差距 |
 | KV Cache | Window + Compressor | 训练不用 | 无 |

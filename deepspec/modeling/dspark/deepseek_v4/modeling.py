@@ -261,62 +261,202 @@ class DSparkAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# MoE — matches official ``DeepseekV3MoE`` in cann-recipes (training fallback)
+# MoE — training counterpart of official ``DeepseekV3MoE`` in cann-recipes
 # ---------------------------------------------------------------------------
 
+class DSparkExpert(nn.Module):
+    """Unquantized training counterpart of one DeepSeek-V4 SwiGLU expert."""
+
+    def __init__(self, hidden_size: int, intermediate_size: int, swiglu_limit=None):
+        super().__init__()
+        self.w1 = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.w2 = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.w3 = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.swiglu_limit = (
+            None if swiglu_limit is None else float(swiglu_limit)
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        gate = self.w1(hidden_states)
+        up = self.w3(hidden_states)
+        if self.swiglu_limit is not None and self.swiglu_limit > 0:
+            gate = gate.clamp(max=self.swiglu_limit)
+            up = up.clamp(
+                min=-self.swiglu_limit,
+                max=self.swiglu_limit,
+            )
+        return self.w2(F.silu(gate) * up)
+
+
 class DSparkMoE(nn.Module):
-    """Structurally matches ``DeepseekV3MoE`` / ``DeepseekV3SharedExpert``.
+    """Training implementation of the DeepSeek-V4 routed + shared MoE.
 
-    Checkpoint keys (per layer):
-        ``ffn.gate.weight``, ``ffn.gate.bias`` — routing gate
-        ``ffn.experts.{eid}.w1/w2/w3.*`` — 256 routed experts (FP4)
-        ``ffn.shared_experts.w1/w2/w3.*`` — shared expert
+    This mirrors ``DeepseekV3MoE`` in cann-recipes-infer while using ordinary
+    PyTorch modules instead of quantized GMM and EP dispatch/combine kernels.
+    Parameter names intentionally follow the HF checkpoint layout:
 
-    During training the routed experts are replaced with a single dense
-    SwiGLU FFN.  The gate is created but unused until top-k routing is
-    enabled.  Shared expert is a separate dense branch (additive residual).
+    - ``gate.weight`` and ``gate.e_score_correction_bias``
+    - ``experts.{eid}.w1/w2/w3.weight``
+    - ``shared_experts.w1/w2/w3.weight``
     """
 
-    def __init__(self, config, prefix: str = ""):
+    def __init__(self, config, prefix: str = "", layer_idx: int = 0):
         super().__init__()
-        _ = prefix  # kept for canonical alignment with official loaders
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = getattr(
-            config, "moe_intermediate_size", config.hidden_size * 4,
+        _ = prefix  # retained for interface parity with the inference model
+        self.hidden_size = int(config.hidden_size)
+        self.intermediate_size = int(
+            getattr(config, "moe_intermediate_size", config.hidden_size * 4)
         )
-        self.num_experts = getattr(config, "n_routed_experts", 256)
-        self.num_experts_per_tok = getattr(config, "num_experts_per_tok", 6)
-        self.n_shared_experts = getattr(config, "n_shared_experts", 1)
+        self.n_routed_experts = int(getattr(config, "n_routed_experts", 256))
+        self.num_experts = self.n_routed_experts
+        self.top_k = int(getattr(config, "num_experts_per_tok", 6))
+        self.num_experts_per_tok = self.top_k
+        self.n_shared_experts = int(getattr(config, "n_shared_experts", 1))
+        self.routed_scaling_factor = float(
+            getattr(config, "routed_scaling_factor", 1.0)
+        )
+        self.scoring_func = str(getattr(config, "scoring_func", "softmax"))
+        self.topk_method = str(getattr(config, "topk_method", "greedy"))
+        self.norm_topk_prob = bool(getattr(config, "norm_topk_prob", False))
+        self.layer_idx = int(layer_idx)
+        self.hash = self.layer_idx < int(getattr(config, "num_hash_layers", 0))
+        swiglu_limit = getattr(config, "swiglu_limit", None)
 
-        # Routing gate (unused in dense fallback; kept for weight loading).
-        self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
+        assert 0 < self.top_k <= self.n_routed_experts, (
+            "num_experts_per_tok must be in [1, n_routed_experts], got "
+            f"{self.top_k} and {self.n_routed_experts}."
+        )
+        assert self.n_shared_experts in (0, 1), (
+            "The DeepSeek-V4 DSpark training path currently supports zero or "
+            f"one shared expert, got {self.n_shared_experts}."
+        )
 
-        # Dense "routed expert" — single SwiGLU (training fallback for 256 experts).
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.gate = nn.Linear(
+            self.hidden_size,
+            self.n_routed_experts,
+            bias=False,
+        )
+        # Match the reference checkpoint location. The correction bias affects
+        # expert selection only; selected expert weights come from raw scores.
+        self.gate.e_score_correction_bias = nn.Parameter(
+            torch.zeros(self.n_routed_experts, dtype=torch.float32)
+        )
 
-        # Shared expert.
-        if self.n_shared_experts > 0:
-            self.shared_gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-            self.shared_up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-            self.shared_down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.experts = nn.ModuleList(
+            DSparkExpert(
+                self.hidden_size,
+                self.intermediate_size,
+                swiglu_limit=swiglu_limit,
+            )
+            for _ in range(self.n_routed_experts)
+        )
+        self.shared_experts = (
+            DSparkExpert(
+                self.hidden_size,
+                self.intermediate_size,
+                swiglu_limit=swiglu_limit,
+            )
+            if self.n_shared_experts > 0
+            else None
+        )
+
+        # Hash routing is used only by the first target-model layers. DSpark
+        # layers are numbered after the target backbone and therefore normally
+        # use learned soft routing. Keep hash support for architectural parity.
+        if self.hash:
+            vocab_size = int(config.vocab_size)
+            self.register_buffer(
+                "tid2eid",
+                torch.randint(
+                    high=self.n_routed_experts,
+                    size=(vocab_size, self.top_k),
+                    dtype=torch.int32,
+                ),
+                persistent=True,
+            )
         else:
-            self.shared_gate_proj = None
-            self.shared_up_proj = None
-            self.shared_down_proj = None
+            self.tid2eid = None
 
-    def _dense_expert(self, x: torch.Tensor) -> torch.Tensor:
-        gate = torch.nn.functional.silu(self.gate_proj(x))
-        up = self.up_proj(x)
-        return self.down_proj(gate * up)
+    def _compute_scores(self, logits: torch.Tensor) -> torch.Tensor:
+        if self.scoring_func == "sigmoid":
+            return logits.sigmoid()
+        if self.scoring_func == "softmax":
+            return logits.softmax(dim=-1, dtype=torch.float32)
+        if self.scoring_func == "sqrtsoftplus":
+            return F.softplus(logits).sqrt()
+        raise NotImplementedError(
+            f"Unsupported MoE scoring function: {self.scoring_func!r}"
+        )
 
-    def _shared_expert(self, x: torch.Tensor) -> torch.Tensor:
-        if self.shared_gate_proj is None:
-            return 0.0
-        gate = torch.nn.functional.silu(self.shared_gate_proj(x))
-        up = self.shared_up_proj(x)
-        return self.shared_down_proj(gate * up)
+    def _select_experts(
+        self,
+        logits: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        scores = self._compute_scores(logits)
+        if self.topk_method == "greedy":
+            topk_weight, topk_idx = torch.topk(
+                scores,
+                k=self.top_k,
+                dim=-1,
+                sorted=False,
+            )
+        elif self.topk_method == "noaux_tc":
+            if self.hash:
+                assert input_ids is not None, (
+                    "input_ids is required for hash-routed MoE layers."
+                )
+                topk_idx = self.tid2eid[input_ids.reshape(-1).long()].long()
+            else:
+                selection_scores = (
+                    scores
+                    + self.gate.e_score_correction_bias.to(
+                        device=scores.device,
+                        dtype=scores.dtype,
+                    ).unsqueeze(0)
+                )
+                _, topk_idx = torch.topk(
+                    selection_scores,
+                    k=self.top_k,
+                    dim=-1,
+                    sorted=False,
+                )
+            topk_weight = scores.gather(1, topk_idx)
+        else:
+            raise NotImplementedError(
+                f"Unsupported MoE top-k method: {self.topk_method!r}"
+            )
+
+        if self.top_k > 1 and self.norm_topk_prob:
+            topk_weight = topk_weight / topk_weight.sum(
+                dim=-1,
+                keepdim=True,
+            ).clamp_min(1e-20)
+        return topk_idx, topk_weight * self.routed_scaling_factor
+
+    def _forward_routed_experts(
+        self,
+        flat_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        routed_output = torch.zeros_like(flat_states)
+        # This is the differentiable, training-oriented counterpart of the
+        # inference GMM + dispatch/combine path. Only selected experts execute.
+        for expert_id, expert in enumerate(self.experts):
+            token_idx, slot_idx = torch.where(topk_idx == expert_id)
+            if token_idx.numel() == 0:
+                continue
+            expert_output = expert(flat_states.index_select(0, token_idx))
+            expert_weight = topk_weight[token_idx, slot_idx].to(
+                dtype=expert_output.dtype
+            )
+            routed_output.index_add_(
+                0,
+                token_idx,
+                expert_output * expert_weight.unsqueeze(-1),
+            )
+        return routed_output
 
     def forward(
         self,
@@ -326,10 +466,24 @@ class DSparkMoE(nn.Module):
         input_ids=None,
         shared_expert_stream=None,
     ):
-        """Official MoE forward signature.  Dense fallback ignores routing."""
-        y = self._dense_expert(hidden_states)
-        y = y + self._shared_expert(hidden_states)
-        return y
+        _ = (is_prefill, cur_topk_list, shared_expert_stream)
+        original_shape = hidden_states.shape
+        flat_states = hidden_states.reshape(-1, self.hidden_size)
+        # The reference implementation evaluates gate matmul/scoring in FP32
+        # on Atlas A3. Preserve that numerical behaviour during training.
+        logits = F.linear(
+            flat_states.float(),
+            self.gate.weight.float(),
+        )
+        topk_idx, topk_weight = self._select_experts(logits, input_ids)
+        output = self._forward_routed_experts(
+            flat_states,
+            topk_idx,
+            topk_weight,
+        )
+        if self.shared_experts is not None:
+            output = output + self.shared_experts(flat_states)
+        return output.view(original_shape)
 
 
 # ---------------------------------------------------------------------------
@@ -479,7 +633,17 @@ class DeepSeekV4DSparkDecoderLayer(nn.Module):
         hc_dim = self.hc_mult * config.hidden_size
 
         self.attn = DSparkAttention(config, layer_idx=layer_idx)
-        self.mlp = DSparkMoE(config, prefix=f"mtp.{layer_idx}.ffn")
+        # In the inference model, DSpark stages are numbered after all target
+        # layers (43, 44, 45 for V4-Flash). This keeps them out of the first
+        # ``num_hash_layers`` and enables learned soft routing.
+        global_layer_idx = int(
+            getattr(config, "num_target_layers", config.num_hidden_layers)
+        ) + int(layer_idx)
+        self.mlp = DSparkMoE(
+            config,
+            prefix=f"mtp.{layer_idx}.ffn",
+            layer_idx=global_layer_idx,
+        )
 
         self.attn_norm = RMSNorm(config.hidden_size, eps=self.norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, eps=self.norm_eps)
@@ -931,6 +1095,7 @@ class DeepSeekV4DSparkModel(PreTrainedModel):
 
 __all__ = [
     "DSparkAttention",
+    "DSparkExpert",
     "DSparkMoE",
     "DeepSeekV4DSparkModel",
     "DeepSeekV4DSparkDecoderLayer",

@@ -184,8 +184,25 @@ class BaseTrainer:
             print_on_local_main(
                 "torch.compile is not yet supported on NPU — skipping compilation."
             )
+        full_draft_total_numel = sum(
+            parameter.numel() for parameter in self.draft_model.parameters()
+        )
+        full_draft_trainable_numel = sum(
+            parameter.numel()
+            for parameter in self.draft_model.parameters()
+            if parameter.requires_grad
+        )
+        full_draft_parameter_bytes = sum(
+            parameter.numel() * parameter.element_size()
+            for parameter in self.draft_model.parameters()
+        )
         if self.world_size > 1:
             self.model = self._wrap_with_fsdp(self.model)
+            self._log_fsdp_parameter_sharding(
+                full_total_numel=full_draft_total_numel,
+                full_trainable_numel=full_draft_trainable_numel,
+                full_parameter_bytes=full_draft_parameter_bytes,
+            )
         else:
             print_on_local_main("Single-device — skipping FSDP wrap.")
 
@@ -294,6 +311,65 @@ class BaseTrainer:
         )
         fsdp_kwargs["device_id"] = self.device
         return FSDP(model, **fsdp_kwargs)
+
+    def _log_fsdp_parameter_sharding(
+        self,
+        *,
+        full_total_numel: int,
+        full_trainable_numel: int,
+        full_parameter_bytes: int,
+    ) -> None:
+        local_total_numel = sum(
+            parameter.numel() for parameter in self.draft_model.parameters()
+        )
+        local_trainable_numel = sum(
+            parameter.numel()
+            for parameter in self.draft_model.parameters()
+            if parameter.requires_grad
+        )
+        local_parameter_bytes = sum(
+            parameter.numel() * parameter.element_size()
+            for parameter in self.draft_model.parameters()
+        )
+        local_fraction = (
+            float(local_total_numel) / float(full_total_numel)
+            if full_total_numel > 0
+            else 0.0
+        )
+        is_sharded = local_total_numel < full_total_numel
+        strategy = str(self.args.train.sharding_strategy)
+        print(
+            f"[rank {self.global_rank}] FSDP draft parameter view: "
+            f"strategy={strategy}, sharded={'yes' if is_sharded else 'no'}, "
+            f"local_total_numel={local_total_numel:,}/"
+            f"{full_total_numel:,} ({local_fraction:.2%}), "
+            f"local_trainable_numel={local_trainable_numel:,}/"
+            f"{full_trainable_numel:,}, "
+            f"local_parameter_gib={local_parameter_bytes / 1024**3:.2f}/"
+            f"{full_parameter_bytes / 1024**3:.2f}",
+            flush=True,
+        )
+
+        summed_local_numel = torch.tensor(
+            local_total_numel,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        dist.all_reduce(summed_local_numel, op=dist.ReduceOp.SUM)
+        if is_global_main_process():
+            replication_factor = (
+                float(summed_local_numel.item()) / float(full_total_numel)
+                if full_total_numel > 0
+                else 0.0
+            )
+            print(
+                "FSDP draft parameter sharding summary: "
+                f"strategy={strategy}, world_size={self.world_size}, "
+                f"pre_wrap_total_numel={full_total_numel:,}, "
+                f"sum_rank_local_numel={summed_local_numel.item():,}, "
+                f"replication_factor={replication_factor:.4f}",
+                flush=True,
+            )
 
     def _build_train_dataloader(self, start_offset_samples=0, num_samples=None):
         sampler = StatelessResumableDistributedSampler(
